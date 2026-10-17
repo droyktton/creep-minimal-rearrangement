@@ -73,6 +73,7 @@ struct Params {
 	bool save_moves = false;  // write the time and the moved sites (as runs) of every event to moves.bin
 	double skip = 0;          // steady state after this advance: velocity (and persistence) measured there
 	double persistence = 0;   // T > 0: persistence and chi4 up to tau = persistence / v (0: off)
+	int origins = 10;         // persistence: origins opened per tau_max
 	double checkpoint = 0;    // write checkpoint.bin every this many seconds of wall time (0: never)
 	double walltime = 0;      // stop after this many seconds with a checkpoint, exit status 3 (0: off)
 	bool restart = false;     // resume from checkpoint.bin in --out if present
@@ -466,7 +467,7 @@ public:
 // longer than the correlation length of p_i. For q != 0 the sum over all sites vanishes, so the
 // sum over p_i is minus the sum over the sites moved by tau, accumulated in the order of their
 // first move: O(L n_q) per origin.
-// Origins are opened every tmax/10; each keeps the time of the first move of every site after
+// Origins are opened every tmax/N (N = 10 by default); each keeps the time of the first move of every site after
 // t0, and is closed, adding pi, pi^2 and S4 on the grid of tau, once t > t0 + tmax.
 class Persistence {
 public:
@@ -511,14 +512,14 @@ public:
 		}
 	}
 	bool on() const { return tmax > 0; }
-	// tau from 1e-3 tau1 to X tau1, 60 values per log scale, origins from time t on
-	void start(double t, double tau1, double X)
+	// tau from 1e-3 tau1 to X tau1, 60 values per log scale, N origins per tau_max from time t on
+	void start(double t, double tau1, double X, int N = 10)
 	{
 		tmax = X * tau1;
 		int nb = (int)(60 * std::log10(X / 1e-3)) + 1;
 		for (int b = 0; b < nb; b++) tau.push_back(1e-3 * tau1 * std::pow(X / 1e-3, (double)b / (nb - 1)));
 		S1.assign(nb, 0); S2.assign(nb, 0); S4.assign((size_t)nb * modes.size(), 0);
-		every = tmax / 10; next = t;
+		every = tmax / N; next = t;
 	}
 	// an event at time t moved the sites in moved
 	void event(double t, const std::vector<int> &moved)
@@ -597,6 +598,7 @@ static void usage(const char *prog)
 	          << "  --save-moves   write the time and the moved sites of every step to moves.bin\n"
 	          << "  --skip X       steady state after an advance X: velocity in summary.txt [0]\n"
 	          << "  --persistence X  T > 0: persistence and chi4 up to tau = X/v (needs --skip) [0: off]\n"
+	          << "  --origins N    persistence: origins opened per tau_max (each keeps L doubles) [10]\n"
 	          << "  --checkpoint S write checkpoint.bin every S seconds of wall time [0: never]\n"
 	          << "  --walltime S   after S seconds (or on SIGTERM, SIGINT, SIGUSR1 if checkpointing)\n"
 	          << "                 write checkpoint.bin and exit with status 3  [0: off]\n"
@@ -638,6 +640,7 @@ int main(int argc, char **argv)
 		else if (o == "--skip") p.skip = std::stod(val());
 		else if (o == "--save-moves") p.save_moves = true;
 		else if (o == "--persistence") p.persistence = std::stod(val());
+		else if (o == "--origins") p.origins = std::stoi(val());
 		else if (o == "--checkpoint") p.checkpoint = std::stod(val());
 		else if (o == "--walltime") p.walltime = std::stod(val());
 		else if (o == "--restart") p.restart = true;
@@ -660,7 +663,7 @@ int main(int argc, char **argv)
 	   << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed
 	   << "\nrng " << (p.philox ? "philox" : "mt") << "\nxi_x " << p.xi_x << "\nxi_u " << p.xi_u << "\nlmax " << line.lmax
 	   << "\nT " << p.T << "\nU0 " << p.U0 << "\ntheta " << p.theta << "\nkmc_seed " << p.kmc_seed
-	   << "\nevents " << p.events << "\nadvance " << p.advance << "\nskip " << p.skip << "\npersistence " << p.persistence
+	   << "\nevents " << p.events << "\nadvance " << p.advance << "\nskip " << p.skip << "\npersistence " << p.persistence << "\norigins " << p.origins
 	   << "\nconf_every " << p.conf_every << "\nsave_events " << p.save_events << "\nsave_moves " << p.save_moves << "\n";
 	const std::string ptxt = pt.str();
 	namespace fs = std::filesystem;
@@ -779,7 +782,7 @@ int main(int argc, char **argv)
 			st.t_skip = st.t; st.u_skip = st.u_now; st.s_skip = s;
 			if (p.persistence > 0) {
 				double v = (st.u_skip - st.u_half) / (st.t_skip - st.t_half);  // velocity over the second half of the transient
-				pers.start(st.t, 1.0 / v, p.persistence);
+				pers.start(st.t, 1.0 / v, p.persistence, p.origins);
 			}
 		}
 		if (pers.on()) pers.event(st.t, moved);

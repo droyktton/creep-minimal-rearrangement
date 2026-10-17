@@ -43,6 +43,7 @@ Options (`build/mr_creep --help`):
 | `--save-moves` | write the time and the moved sites of every step to `moves.bin` (about 20 bytes per step) | off |
 | `--skip` | the steady state starts once the mean position has advanced by this much; the velocity is measured from there | 0 |
 | `--persistence` | T > 0: persistence and χ4 up to τ = X/v (needs `--skip`) | 0 (off) |
+| `--origins` | persistence: origins opened per τ_max; each open origin keeps L doubles | 10 |
 | `--checkpoint` | write `checkpoint.bin` every this many seconds of wall time | 0 (never) |
 | `--walltime` | after this many seconds, or on SIGTERM, SIGINT or SIGUSR1 when checkpointing, write `checkpoint.bin` and exit with status 3 | 0 (off) |
 | `--restart` | resume from `checkpoint.bin` in `--out` if it exists; exit 0 at once if the run is already done | off |
@@ -68,10 +69,10 @@ Outputs:
 - `summary.txt`: number of steps, advance, steps that needed windows beyond ℓ_max (`lmax_extended`) and, in the steady state, steps, advance, time, velocity v and ln v. Times are in units of 1/ν₀, with rates ν₀·exp(−U(ℓ)/T). With `--persistence` it also gives τ_α and the maximum of χ4.
 - `persistence.dat` (with `--persistence`): τ, ⟨π⟩, ⟨π²⟩ and χ4, in the steady state [4]:
   - π(τ) = (1/L) Σ_i p_i(τ), where p_i(τ) = 1 if site i does not move in [t₀, t₀ + τ];
-  - the averages run over origins t₀ every τ_max/10;
+  - the averages run over origins t₀ every τ_max/N (`--origins N`);
   - χ4(τ) = L(⟨π²⟩ − ⟨π⟩²);
   - τ_α is defined by ⟨π(τ_α)⟩ = 1/2;
-  - the grid of τ spans 10⁻³/v to X/v, where v is measured over the second half of the transient (advance `skip`/2 to `skip`).
+  - the grid of τ spans 10⁻³/v to X/v, where v is measured over the second half of the transient (advance `skip`/2 to `skip`). At low T a few long waits dominate the time, and this v can be off by a factor of several: take X large (1000) with more origins (`--origins 100`), and the run several times longer than X/v. τ_α is −1 when π does not reach 1/2 on the grid.
   - Both are accumulated during the run: each origin keeps the time of the first move of every site.
 - `s4.dat` (with `--persistence`): the four-point structure factor S4(q, τ) = (1/L)⟨|Σ_i p_i(τ) e^{iqi}|²⟩ on the same grid of τ, one row per τ: τ, then S4 at each q. The second comment line lists the q = 2πn/L: n = 1 to 16, then 8 per decade up to L/2. S4(q → 0) tends to χ4 when L is much longer than the correlation length of p_i.
 

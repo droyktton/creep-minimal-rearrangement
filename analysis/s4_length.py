@@ -12,7 +12,9 @@ At tau_alpha (pi = 1/2, default) or at the maximum of chi4, S4(q) is fitted to t
 Ornstein-Zernike form A / (1 + (q ell)^2) (the correlation of the persistence decaying as
 exp(-r/ell)), on the modes with S4 >= S4(q_1) / 20. Also given: ell_half = 1/q_half, with
 S4(q_half) = A / 2, the same for the Ornstein-Zernike form, and chi4(tau) with L / ell.
-One line per point: f T L lmax theta samples origins tau chi4 A ell ell_half.
+The ratio r12 = S4(q_1)/S4(q_2) tends to 4 when ell >> L/(2 pi) (Ornstein-Zernike): ell is then
+not resolved by the system and the fits fail or give only a lower bound (r12 > 3 is flagged).
+One line per point: f T L lmax theta samples origins tau chi4 A ell ell_half r12 resolved.
 """
 import argparse
 import os
@@ -51,8 +53,11 @@ def oz(q, A, ell):
 def fit(q, s):
     use = s >= s[0] / 20
     ell = 1 / q[np.argmin(abs(s - s[0] / 2))]
-    (A, ell), _ = curve_fit(lambda x, a, l: np.log(oz(x, a, l)), q[use], np.log(s[use]),
-                            p0=(s[0], ell), bounds=((0, 0), (np.inf, np.inf)))
+    try:
+        (A, ell), _ = curve_fit(lambda x, a, l: np.log(oz(x, a, l)), q[use], np.log(s[use]),
+                                p0=(s[0], ell), bounds=((0, 0), (np.inf, np.inf)), max_nfev=10000)
+    except (RuntimeError, ValueError):
+        return np.nan, np.nan, np.nan
     # q_half: where the data cross A/2, by log-linear interpolation
     k = np.nonzero(s < A / 2)[0]
     if len(k) == 0 or k[0] == 0:
@@ -78,7 +83,7 @@ def main():
         groups[tuple(sorted((k, v) for k, v in p.items() if k not in SEEDS | {"Fc", "F"}))].append(d)
 
     out = open(a.out, "w") if a.out else sys.stdout
-    print("# f T L lmax theta samples origins tau chi4 A ell ell_half", file=out)
+    print("# f T L lmax theta samples origins tau chi4 A ell ell_half r12 resolved", file=out)
     for key, ds in sorted(groups.items(), key=lambda g: tuple(float(dict(g[0])[k].split()[0]) for k in ("L", "f", "T"))):
         p = dict(key)
         q = None
@@ -109,8 +114,9 @@ def main():
         else:
             b = int(np.argmax(chi4))
         A, ell, ellh = fit(q, S[b, 1:])
+        r12 = S[b, 1] / S[b, 2]
         print(f"{p['f'].split()[0]} {p['T']} {p['L']} {p['lmax']} {p['theta']} {len(ds)} {W} "
-              f"{tau[b]:.6g} {chi4[b]:.6g} {A:.6g} {ell:.6g} {ellh:.6g}", file=out)
+              f"{tau[b]:.6g} {chi4[b]:.6g} {A:.6g} {ell:.6g} {ellh:.6g} {r12:.3g} {int(r12 <= 3)}", file=out)
 
 
 if __name__ == "__main__":
