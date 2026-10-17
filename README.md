@@ -53,7 +53,40 @@ Outputs:
   - `L_rel`: sites moved from α to the new metastable state γ;
   - `area`: Σ(γ − α);
   - `mean_u`, and `E`, the energy of γ;
-  - `dt`: duration of the step at T > 0, in units of e^{U(2)/T}/ν₀ (0 at T = 0).
+  - `dt`: duration of the step at T > 0, in units of e^{U(2)/T}/ν₀ (0 at T = 0);
+  - `i`: start of the activated window [i, i+l];
+  - `x_left`: left end of the moved region (sites with γ ≠ α) that contains the window.
+
+## Demo
+
+`demo/run_demo.sh` runs the examples below (about 10 minutes with 3 parallel jobs) and `demo/plot_demo.py` makes the figures.
+
+All runs use one sample: Philox disorder, seed 1, not periodic in u (`--M 0`), L = 1024. F_c of this sample is 0.927, computed with M = 4096. Each run continues until the line has advanced by 1200, and the analysis keeps the steady state (advance > 300).
+
+### T → 0⁺
+
+F/F_c = 0.32, 0.11, 0.032 and 0.011.
+
+![T -> 0+](demo/figures/t0_creep.png)
+
+- (a) Activity map at f = 0.011: the region moved by each event. The events form spatio-temporal clusters, as in Fig. 1 of [1].
+- (b) Metastable states at f = 0.011.
+- (c) Structure factor, rescaled by the crossover length ℓ_opt ∼ f^{−ν_eq}, ν_eq = 3/4 [4]. The curves of the four forces collapse, with ζ_eq = 2/3 at large q and a steeper, depinning-like decay at small q.
+- (d) Mean window ℓ of the activated rearrangement and mean L_rel. Both grow as f decreases, but here only as about f^{−0.37}, not as the f^{−3/4} of ℓ_opt: the smallest energy-lowering window is mostly far below ℓ_opt at these forces.
+- (e) Distribution of the event area: the cutoff grows as f decreases.
+- (f) Area against L_rel.
+
+### Finite temperature
+
+F = 0.093 (f = 0.1), ℓ_max = 50, U(ℓ) = ℓ^{1/3}, T = 0 (with the same ℓ_max), 0.25, 0.5, 1 and 2.
+
+![finite T](demo/figures/finite_t.png)
+
+- (a) Structure factor. At T > 0 the small-q part lies below that of T → 0⁺, towards the thermal ζ = 1/2.
+- (b) Window ℓ of the activated rearrangements. It widens with T. At T ≥ 1 it piles up near ℓ_max: the rates of U(ℓ) = ℓ^{1/3} hardly differ between windows, so the more numerous large windows dominate, and the results depend on ℓ_max.
+- (c) Velocity against 1/T, from the advance and Σdt in units of 1/ν₀. It follows Arrhenius with an effective barrier of 3.2 ≈ U(30), the barrier of the typical window.
+- (d, e) Activity maps at T = 1 and 2. Unlike at T → 0⁺, the events are spread uniformly, without clusters.
+- (f) Distribution of the event area.
 
 ## Model
 

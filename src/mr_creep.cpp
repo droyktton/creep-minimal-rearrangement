@@ -195,6 +195,7 @@ public:
 
 	void prefix(int dir)
 	{
+		rebase();  // the moves read V at u and u +- 1
 		for (int s = 0; s < L; s++) ds[s] = site(s, u[s] + dir) - site(s, u[s]);
 		P[0] = 0; D[0] = 0;
 		for (int s = 0; s < 2 * L; s++) { P[s + 1] = P[s] + ds[s % L]; D[s + 1] = D[s] + dirty[s % L]; }
@@ -298,6 +299,7 @@ public:
 	std::vector<Candidates> cand;
 	std::vector<char> valid;
 	double dt = 0;  // time of the last step (T > 0), in units of exp(U(2)/T)/nu0
+	int last_i = 0; // start of the window of the last step
 
 	// rate exp(-U(l)/T) relative to that of the smallest window, exp(-U(2)/T)
 	double rate(int l) const { return std::exp(-U0 * (std::pow((double)l, theta) - std::pow(2.0, theta)) / T); }
@@ -408,6 +410,7 @@ public:
 			int reach = (T == 0 && !cand[i].w.empty()) ? cand[i].w[0].l : lmax;
 			if (moved[i + reach + 1] - moved[i] > 0) valid[i] = 0;
 		}
+		last_i = ib;
 		return w;
 	}
 };
@@ -502,7 +505,7 @@ int main(int argc, char **argv)
 	}
 	std::ofstream ev(p.out + "/events.dat");
 	// dt: time of the step at T > 0, in units of exp(U(2)/T)/nu0 (0 at T = 0)
-	ev << "# step l gain L_act L_rel area mean_u E dt\n";
+	ev << "# step l gain L_act L_rel area mean_u E dt i x_left\n";
 	ev.precision(10);
 	std::ofstream conf, evconf;
 	if (p.conf_every > 0) conf.open(p.out + "/configs.bin", std::ios::binary);
@@ -515,6 +518,10 @@ int main(int argc, char **argv)
 		alpha = line.u;
 		Line::Window w = line.creep_step(beta);
 		if (!w.l) { std::cerr << "step " << s << ": no rearrangement up to lmax = " << line.lmax << "\n"; return 2; }
+		// left end of the moved region that contains the activated window (sites i+1 .. i+l-1)
+		int x_left = (line.last_i + 1) % p.L;
+		for (int k = 0; k < p.L && alpha[(x_left - 1 + p.L) % p.L] != line.u[(x_left - 1 + p.L) % p.L]; k++)
+			x_left = (x_left - 1 + p.L) % p.L;
 		int Lact = 0, Lrel = 0;
 		long area = 0, sum = 0;
 		for (int i = 0; i < p.L; i++) {
@@ -524,7 +531,8 @@ int main(int argc, char **argv)
 			sum += line.u[i];
 		}
 		ev << s << " " << w.l << " " << w.gain << " " << Lact << " " << Lrel << " " << area << " "
-		   << (double)sum / p.L << " " << line.energy(line.u) << " " << (p.T > 0 ? line.dt : 0.0) << std::endl;
+		   << (double)sum / p.L << " " << line.energy(line.u) << " " << (p.T > 0 ? line.dt : 0.0) << " "
+		   << line.last_i << " " << x_left << std::endl;
 		if (p.save_events)
 			for (const auto *x : {&alpha, &beta, &line.u}) evconf.write((const char *)x->data(), sizeof(int) * p.L);
 		if (p.conf_every > 0 && s % p.conf_every == 0) conf.write((const char *)line.u.data(), sizeof(int) * p.L);
