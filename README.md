@@ -65,7 +65,7 @@ Outputs:
   - `i`: start of the activated window [i, i+l];
   - `x_left`, `extent`: the smallest arc [x_left, x_left + extent) that contains the moved sites (γ ≠ α). The moved set need not be contiguous, because the optimal path can touch the line inside the window.
 - `moves.bin` (with `--save-moves`): per step, the time (a double; the step number at T = 0), the number n of runs of moved sites (int32), and n pairs (start, length) (int32).
-- `summary.txt`: number of steps, advance and, in the steady state, steps, advance, time, velocity v and ln v. Times are in units of 1/ν₀, with rates ν₀·exp(−U(ℓ)/T). With `--persistence` it also gives τ_α and the maximum of χ4.
+- `summary.txt`: number of steps, advance, steps that needed windows beyond ℓ_max (`lmax_extended`) and, in the steady state, steps, advance, time, velocity v and ln v. Times are in units of 1/ν₀, with rates ν₀·exp(−U(ℓ)/T). With `--persistence` it also gives τ_α and the maximum of χ4.
 - `persistence.dat` (with `--persistence`): τ, ⟨π⟩, ⟨π²⟩ and χ4, in the steady state [4]:
   - π(τ) = (1/L) Σ_i p_i(τ), where p_i(τ) = 1 if site i does not move in [t₀, t₀ + τ];
   - the averages run over origins t₀ every τ_max/10;
@@ -208,7 +208,8 @@ On one desktop core, 3000 steps at L = 4096 and F = 0.093 (f ≈ 0.1) take:
 Limits:
 - **Relaxation.** It still costs O(L) per elementary move (prefix sums and the test for favourable blocks). At T = 0 it dominates, and threads do not help.
 - **F_c.** Locating it needs an advance of 2M with full scans of the blocks (145 s at L = 1024, M = 4096). Give F with `--absolute` to skip it.
-- **Windows at small f.** At T > 0 a step costs about ℓ_max³: ℓ_max + extent windows are recomputed, each at cost ~ℓ_max². ℓ_max must grow with the activation size, about as f^{−3/4}. At L = 1024 and T = 0.05 the line got stuck at f = 0.01 with ℓ_max = 50 (no energy-lowering window), and ℓ_max = 100 suffices at f = 0.03.
+- **Windows at small f.** At T > 0 a step costs about ℓ_max³: ℓ_max + extent windows are recomputed, each at cost ~ℓ_max². ℓ_max must grow with the activation size, about as f^{−3/4}. At L = 1024 and T = 0.05, ℓ_max = 50 suffices at f = 0.1 and ℓ_max = 100 at f = 0.03 (the largest window drawn is 25 and 51).
+- **No window up to ℓ_max.** At small f the line can reach a state where no window up to ℓ_max lowers the energy (at f = 0.01: after 322 steps with ℓ_max = 50, after 1158 with ℓ_max = 100). That step then looks for windows up to 2ℓ_max, 4ℓ_max, ... (at most L − 1), and `summary.txt` counts these steps (`lmax_extended`). Windows beyond ℓ_max are thus neglected only when smaller ones exist, whose rates are larger by exp((U(ℓ_max) − U(ℓ))/T).
 - **Memory.** Only with `--rng mt`, where the disorder is stored as L·M doubles (512 MB at L = 4096, M = 16384).
 
 ## References
