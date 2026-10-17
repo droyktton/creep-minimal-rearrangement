@@ -73,7 +73,7 @@ Outputs:
 
 `demo/run_demo.sh` runs the examples below (about 40 minutes with 3 parallel jobs) and `demo/plot_demo.py` makes the figures.
 
-The runs use Philox disorder, seed 1, not periodic in u (`--M 0`), and L = 1024 (F_c = 0.927, computed with M = 4096), except the persistence runs, which use L = 512 (F_c = 0.949). Each run continues until the line has advanced by 1200, and the analysis keeps the steady state (advance > 300).
+The runs use Philox disorder, seed 1, not periodic in u (`--M 0`), and L = 1024 (F_c = 0.927, computed with M = 4096), except the persistence runs, which use L = 512 (F_c = 0.949). Unless stated otherwise, each run continues until the line has advanced by 1200, and the analysis keeps the steady state (advance > 300).
 
 ### T → 0⁺
 
