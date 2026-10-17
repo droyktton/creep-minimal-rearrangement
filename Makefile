@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -fopenmp
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -fopenmp -isystem third_party
 
 build/mr_creep: src/mr_creep.cpp
 	@mkdir -p build

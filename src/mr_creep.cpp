@@ -7,9 +7,13 @@
 // T > 0: its extension by G. Russo, E. E. Ferrero, A. B. Kolton, A. Rosso and D. Vandembroucq,
 //   arXiv:2604.17600 (2026), a kinetic Monte Carlo over all the energy-lowering rearrangements.
 //
-// Model: u_i integer, i = 0..L-1 periodic, u_i in a random potential periodic in u with period M,
+// Model: u_i integer, i = 0..L-1 periodic, u_i in a random potential periodic in u with period M
+// (M = 0: not periodic),
 //   E = sum_i [ V(i, u_i mod M) - F u_i + (c/2) (u_{i+1} - u_i)^2 ],  |u_{i+1} - u_i| <= mcut.
-// Same energy, disorder and random numbers as krgk_creep, so both codes see the same sample.
+// The Gaussian disorder V(i, u) is generated on demand from the counter (i, u) and the seed with
+// the Philox4x32-10 generator of Random123, so it is not stored (default), or stored as a table of
+// Mersenne Twister numbers as in krgk_creep (--rng mt): with the same seed both codes then see
+// the same sample.
 //
 // Each creep step goes from a metastable state alpha to the next one, gamma, in two steps:
 // (i) activation: the smallest compact rearrangement that lowers the energy. For every window
@@ -30,12 +34,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
 #include <vector>
+#include <Random123/philox.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -49,6 +55,7 @@ struct Params {
 	double disorder = 1.0, c = 2.0, f = 0.5;
 	bool f_absolute = false;
 	unsigned long seed = 12345;
+	bool philox = true;       // disorder on demand (Random123 Philox); false: Mersenne Twister table
 	long events = 100;
 	double advance = 0;       // stop earlier, once the mean position has advanced by this much
 	int lmax = 0;             // largest window (0: L - 1 at T = 0, min(50, L - 1) at T > 0)
@@ -90,15 +97,31 @@ public:
 	double c, F = 0.0;
 	double T, U0, theta;
 	std::mt19937_64 kmc;
-	std::vector<double> V;  // V[i*M + j]
+	bool philox;
+	double strength;
+	r123::Philox4x32::key_type key;
+	std::vector<double> V;  // V[i*M + j], table of the Mersenne Twister disorder (--rng mt)
+	// Philox disorder: cache of V(s, x) for x in [base_s, base_s + W) at each site, refilled when
+	// the line leaves it (rebase); outside the band V is computed directly
+	int W = 0;
+	std::vector<double> band;
+	std::vector<int> base;
 	std::vector<int> u;
 
 	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut),
 		lmax(p.lmax > 0 ? p.lmax : (p.T > 0 ? std::min(50, p.L - 1) : p.L - 1)), c(p.c),
 		T(p.T), U0(p.U0), theta(p.theta), kmc(p.kmc_seed),
-		V((size_t)p.L * p.M), u(p.L, 0), dirty(p.L, 1), ds(p.L), P(2 * p.L + 1), D(2 * p.L + 1),
+		philox(p.philox), strength(p.disorder), key{{(uint32_t)p.seed, (uint32_t)(p.seed >> 32)}},
+		V(p.philox ? 0 : (size_t)p.L * p.M), u(p.L, 0), dirty(p.L, 1), ds(p.L), P(2 * p.L + 1), D(2 * p.L + 1),
 		cand(p.L), valid(p.L, 0)
 	{
+		if (philox) {
+			int Kb = std::min(lmax * mcut, 64);
+			W = 3 * Kb + 4;
+			band.resize((size_t)L * W);
+			base.assign(L, INT32_MIN / 2);
+			return;
+		}
 		Random rng(p.seed);
 		for (auto &v : V) v = rng.gauss();
 		double mean = 0.0;
@@ -107,7 +130,40 @@ public:
 		for (auto &v : V) v = (v - mean) * p.disorder;
 	}
 
-	double pot(int i, int j) const { int m = j % M; if (m < 0) m += M; return V[(size_t)i * M + m]; }
+	double pot(int i, int j) const
+	{
+		if (philox) {
+			unsigned x = (unsigned)(j - base[i]);
+			if (x < (unsigned)W) return band[(size_t)i * W + x];
+		}
+		return pot_raw(i, j);
+	}
+
+	// keep u_s - 1 .. u_s + 2 Kb + 1, the values the windows and the moves read, in the band
+	void rebase()
+	{
+		if (!philox) return;
+		int Kb = (W - 4) / 3;
+		for (int s = 0; s < L; s++) {
+			if (u[s] - 1 >= base[s] && u[s] + 2 * Kb + 2 <= base[s] + W) continue;
+			base[s] = u[s] - 1;
+			for (int x = 0; x < W; x++) band[(size_t)s * W + x] = pot_raw(s, base[s] + x);
+		}
+	}
+
+	double pot_raw(int i, int j) const
+	{
+		int m = j;
+		if (M > 0) { m = j % M; if (m < 0) m += M; }
+		if (!philox) return V[(size_t)i * M + m];
+		// Box-Muller from two 64-bit uniforms in (0, 1) made of the four 32-bit outputs
+		r123::Philox4x32::ctr_type ctr = {{(uint32_t)i, (uint32_t)m, 0, 0}};
+		auto r = r123::Philox4x32()(ctr, key);
+		const double k = 1.0 / 9007199254740992.0;  // 2^-53
+		double u1 = ((double)((((uint64_t)r[0] << 32) | r[1]) >> 11) + 0.5) * k;
+		double u2 = ((double)((((uint64_t)r[2] << 32) | r[3]) >> 11) + 0.5) * k;
+		return strength * std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
+	}
 	double site(int i, int x) const { return pot(i, x) - F * x; }
 
 	double energy(const std::vector<int> &x) const
@@ -296,6 +352,7 @@ public:
 	// configuration (before relaxation). Returns the window, or l = 0 if none up to lmax.
 	Window creep_step(std::vector<int> &beta)
 	{
+		rebase();
 		std::vector<int> todo;
 		for (int i = 0; i < L; i++) if (!valid[i]) todo.push_back(i);
 		#pragma omp parallel for schedule(dynamic, 4)
@@ -355,13 +412,14 @@ static void usage(const char *prog)
 {
 	std::cerr << "usage: " << prog << " [options]\n"
 	          << "  --L N          line length (sites, periodic)                [64]\n"
-	          << "  --M N          period of the disorder along u              [1024]\n"
+	          << "  --M N          period of the disorder along u (0: none)    [1024]\n"
 	          << "  --mcut N       maximal slope |u_{i+1}-u_i|                 [1]\n"
 	          << "  --disorder X   disorder strength (Gaussian, std X)         [1.0]\n"
 	          << "  --c X          elastic constant                            [2.0]\n"
 	          << "  --f X          drive F/F_c (or F with --absolute)          [0.5]\n"
 	          << "  --absolute     --f is the absolute force F (F_c is then not computed)\n"
-	          << "  --seed N       random seed                                 [12345]\n"
+	          << "  --seed N       seed of the disorder                        [12345]\n"
+	          << "  --rng G        disorder: philox (on demand) or mt (table)  [philox]\n"
 	          << "  --events N     number of creep steps                       [100]\n"
 	          << "  --advance X    stop once the mean position advanced by X   [0: off]\n"
 	          << "  --lmax N       largest rearrangement window        [L-1; at T > 0: 50]\n"
@@ -389,6 +447,11 @@ int main(int argc, char **argv)
 		else if (o == "--f") p.f = std::stod(val());
 		else if (o == "--absolute") p.f_absolute = true;
 		else if (o == "--seed") p.seed = std::stoul(val());
+		else if (o == "--rng") {
+			std::string g = val();
+			if (g != "philox" && g != "mt") { usage(argv[0]); return 1; }
+			p.philox = g == "philox";
+		}
 		else if (o == "--events") p.events = std::stol(val());
 		else if (o == "--advance") p.advance = std::stod(val());
 		else if (o == "--lmax") p.lmax = std::stoi(val());
@@ -401,7 +464,9 @@ int main(int argc, char **argv)
 		else if (o == "--out") p.out = val();
 		else { usage(argv[0]); return 1; }
 	}
-	if (p.L < 3 || p.M < 2 || p.mcut < 1) { std::cerr << "need L >= 3, M >= 2, mcut >= 1\n"; return 1; }
+	if (p.L < 3 || p.M < 0 || p.M == 1 || p.mcut < 1) { std::cerr << "need L >= 3, M = 0 or M >= 2, mcut >= 1\n"; return 1; }
+	if (p.M == 0 && !p.philox) { std::cerr << "M = 0 (no period) needs --rng philox\n"; return 1; }
+	if (p.M == 0 && !p.f_absolute) { std::cerr << "M = 0: F_c cannot be located, give F with --absolute\n"; return 1; }
 	if (p.lmax >= p.L) { std::cerr << "need lmax < L\n"; return 1; }
 
 	Line line(p);
@@ -416,7 +481,8 @@ int main(int argc, char **argv)
 
 	std::ofstream log(p.out + "/params.txt");
 	log << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
-	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed << "\nlmax " << line.lmax
+	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed
+	    << "\nrng " << (p.philox ? "philox" : "mt") << "\nlmax " << line.lmax
 	    << "\nT " << p.T << "\nU0 " << p.U0 << "\ntheta " << p.theta << "\nkmc_seed " << p.kmc_seed
 	    << "\nFc " << (p.f_absolute ? "not computed" : std::to_string(Fc)) << "\nF " << line.F << std::endl;
 	if (!p.f_absolute) {

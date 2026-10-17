@@ -5,7 +5,9 @@
 //  3. the cached windows against recomputing every window at every step;
 //  4. the O(L) lowest block-move energy against the minimum over all blocks;
 //  5. at T > 0, the list of all improving windows against brute force, and the cached windows
-//     against recomputing every window at every step (same kinetic Monte Carlo numbers).
+//     against recomputing every window at every step (same kinetic Monte Carlo numbers);
+//  6. the Philox disorder: known-answer test of Philox4x32-10, mean and variance of V, and the
+//     cached band against direct generation.
 #define main mr_main
 #include "../src/mr_creep.cpp"
 #undef main
@@ -162,5 +164,26 @@ int main()
 		}
 	}
 	printf("5. T > 0: candidates vs brute force and cached vs recomputed: %d mismatches (%d steps, %d candidates)\n", bad5, steps5, cands);
-	return bad + bad2 + bad3 + bad4 + bad5 ? 1 : 0;
+
+	int bad6 = 0;
+	{
+		r123::Philox4x32::ctr_type c = {{0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344}};
+		r123::Philox4x32::key_type k = {{0xa4093822, 0x299f31d0}};
+		auto r = r123::Philox4x32()(c, k);  // known answer of Random123 (kat_vectors)
+		bad6 += !(r[0] == 0xd16cfe09 && r[1] == 0x94fdcceb && r[2] == 0x5001e420 && r[3] == 0x24126ea1);
+		Params p; p.L = 1000; p.M = 0; p.disorder = 1.5;
+		Line l(p);
+		double m = 0, v = 0, n = 0;
+		for (int i = 0; i < p.L; i++)
+			for (int j = -500; j < 500; j++) { double x = l.pot(i, j); m += x; v += x * x; n++; }
+		m /= n; v = v / n - m * m;
+		if (std::abs(m) > 0.01 || std::abs(v / 2.25 - 1) > 0.01) { bad6++; printf("Philox V: mean %g variance %g (expected 0, 2.25)\n", m, v); }
+		l.u.assign(p.L, 0);
+		for (int i = 0; i < p.L; i++) l.u[i] = (i * 7919) % 300 - 150;
+		l.rebase();
+		for (int i = 0; i < p.L; i++)
+			for (int j = l.u[i] - 10; j < l.u[i] + 400; j++) bad6 += l.pot(i, j) != l.pot_raw(i, j);
+	}
+	printf("6. Philox disorder (known answer, moments, cached band): %d mismatches\n", bad6);
+	return bad + bad2 + bad3 + bad4 + bad5 + bad6 ? 1 : 0;
 }
