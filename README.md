@@ -31,6 +31,7 @@ Options (`build/mr_creep --help`):
 | `--absolute` | `--f` is the force F; F_c is then not computed | off |
 | `--seed` | seed of the disorder | 12345 |
 | `--rng` | disorder generated on demand (`philox`) or stored as a table (`mt`) | `philox` |
+| `--xi-x`, `--xi-u` | Philox disorder constant on rectangles of xi-x sites by xi-u along u | 1, 1 |
 | `--events` | number of creep steps | 100 |
 | `--advance` | stop earlier, once the mean position has advanced by this much | 0 (off) |
 | `--lmax` | largest rearrangement window | L − 1 at T = 0, 50 at T > 0 |
@@ -66,6 +67,8 @@ The disorder is Gaussian and uncorrelated. It is periodic in u with period M, or
 - The four 32-bit outputs make two 64-bit uniforms, and the Gaussian value comes from the Box–Muller formula.
 - Nothing of size L·M is stored. Each site keeps a cache of V over a band of ~3·min(ℓ_max·mcut, 64) values in front of the line, refilled when the line leaves it.
 - At L = 4096 the code then needs 11 MB instead of 137 MB, and it is slightly faster than with the table, because the band is local in memory.
+
+**Correlated disorder (`--xi-x a --xi-u b`, Philox only).** V(i, u) = g(⌊i/a⌋, ⌊u/b⌋): V is constant on rectangles of a sites by b along u, with independent Gaussian amplitudes. This sets the correlation lengths, possibly anisotropic, independently of the lattice. a must divide L and b must divide M.
 
 **Table (`--rng mt`).** The disorder of krgk-creep and of the original code: Mersenne Twister numbers stored in an L·M table, minus their mean. With the same seed, krgk-creep and mr_creep then simulate the same sample. The energy, the elementary moves and the computation of F_c are also those of krgk-creep.
 
@@ -104,7 +107,7 @@ The method gives the sequence of metastable states and the events, not the energ
 3. the cached windows against recomputing all windows at every step;
 4. the O(L) test for favourable blocks against the minimum over all blocks;
 5. at T > 0, all the candidates against brute force, and the cached against the recomputed windows with the same Monte Carlo numbers;
-6. the Philox disorder: the known answer of Philox4x32-10, the mean and variance of V, and the cached band against direct generation.
+6. the Philox disorder: the known answer of Philox4x32-10, the mean and variance of V, the cached band against direct generation, and the rectangles of correlated disorder.
 
 With `KRGK=path/to/krgk_creep` it also checks that F_c and the critical configuration are those of krgk-creep (both with `--rng mt`).
 

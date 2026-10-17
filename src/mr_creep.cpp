@@ -56,6 +56,7 @@ struct Params {
 	bool f_absolute = false;
 	unsigned long seed = 12345;
 	bool philox = true;       // disorder on demand (Random123 Philox); false: Mersenne Twister table
+	int xi_x = 1, xi_u = 1;   // Philox disorder constant on rectangles of xi_x sites by xi_u in u
 	long events = 100;
 	double advance = 0;       // stop earlier, once the mean position has advanced by this much
 	int lmax = 0;             // largest window (0: L - 1 at T = 0, min(50, L - 1) at T > 0)
@@ -98,6 +99,7 @@ public:
 	double T, U0, theta;
 	std::mt19937_64 kmc;
 	bool philox;
+	int xi_x, xi_u;
 	double strength;
 	r123::Philox4x32::key_type key;
 	std::vector<double> V;  // V[i*M + j], table of the Mersenne Twister disorder (--rng mt)
@@ -111,7 +113,7 @@ public:
 	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut),
 		lmax(p.lmax > 0 ? p.lmax : (p.T > 0 ? std::min(50, p.L - 1) : p.L - 1)), c(p.c),
 		T(p.T), U0(p.U0), theta(p.theta), kmc(p.kmc_seed),
-		philox(p.philox), strength(p.disorder), key{{(uint32_t)p.seed, (uint32_t)(p.seed >> 32)}},
+		philox(p.philox), xi_x(p.xi_x), xi_u(p.xi_u), strength(p.disorder), key{{(uint32_t)p.seed, (uint32_t)(p.seed >> 32)}},
 		V(p.philox ? 0 : (size_t)p.L * p.M), u(p.L, 0), dirty(p.L, 1), ds(p.L), P(2 * p.L + 1), D(2 * p.L + 1),
 		cand(p.L), valid(p.L, 0)
 	{
@@ -156,8 +158,10 @@ public:
 		int m = j;
 		if (M > 0) { m = j % M; if (m < 0) m += M; }
 		if (!philox) return V[(size_t)i * M + m];
+		// one Gaussian amplitude per rectangle of xi_x sites by xi_u in u (floor division), by
 		// Box-Muller from two 64-bit uniforms in (0, 1) made of the four 32-bit outputs
-		r123::Philox4x32::ctr_type ctr = {{(uint32_t)i, (uint32_t)m, 0, 0}};
+		int bi = i / xi_x, bu = m >= 0 ? m / xi_u : -((-m - 1) / xi_u) - 1;
+		r123::Philox4x32::ctr_type ctr = {{(uint32_t)bi, (uint32_t)bu, 0, 0}};
 		auto r = r123::Philox4x32()(ctr, key);
 		const double k = 1.0 / 9007199254740992.0;  // 2^-53
 		double u1 = ((double)((((uint64_t)r[0] << 32) | r[1]) >> 11) + 0.5) * k;
@@ -420,6 +424,7 @@ static void usage(const char *prog)
 	          << "  --absolute     --f is the absolute force F (F_c is then not computed)\n"
 	          << "  --seed N       seed of the disorder                        [12345]\n"
 	          << "  --rng G        disorder: philox (on demand) or mt (table)  [philox]\n"
+	          << "  --xi-x A --xi-u B philox disorder constant on A x B rectangles  [1 1]\n"
 	          << "  --events N     number of creep steps                       [100]\n"
 	          << "  --advance X    stop once the mean position advanced by X   [0: off]\n"
 	          << "  --lmax N       largest rearrangement window        [L-1; at T > 0: 50]\n"
@@ -455,6 +460,8 @@ int main(int argc, char **argv)
 		else if (o == "--events") p.events = std::stol(val());
 		else if (o == "--advance") p.advance = std::stod(val());
 		else if (o == "--lmax") p.lmax = std::stoi(val());
+		else if (o == "--xi-x") p.xi_x = std::stoi(val());
+		else if (o == "--xi-u") p.xi_u = std::stoi(val());
 		else if (o == "--T") p.T = std::stod(val());
 		else if (o == "--U0") p.U0 = std::stod(val());
 		else if (o == "--theta") p.theta = std::stod(val());
@@ -469,6 +476,10 @@ int main(int argc, char **argv)
 	if (p.M == 0 && !p.f_absolute) { std::cerr << "M = 0: F_c cannot be located, give F with --absolute\n"; return 1; }
 	if (p.lmax >= p.L) { std::cerr << "need lmax < L\n"; return 1; }
 
+	if (p.xi_x < 1 || p.xi_u < 1 || p.L % p.xi_x || (p.M > 0 && p.M % p.xi_u) || (!p.philox && (p.xi_x > 1 || p.xi_u > 1))) {
+		std::cerr << "need xi_x, xi_u >= 1, xi_x dividing L and xi_u dividing M, and --rng philox if xi > 1\n";
+		return 1;
+	}
 	Line line(p);
 	// F_c costs an advance of 2M with full scans of the blocks: skipped with --absolute
 	std::vector<int> crit;
@@ -482,7 +493,7 @@ int main(int argc, char **argv)
 	std::ofstream log(p.out + "/params.txt");
 	log << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
 	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed
-	    << "\nrng " << (p.philox ? "philox" : "mt") << "\nlmax " << line.lmax
+	    << "\nrng " << (p.philox ? "philox" : "mt") << "\nxi_x " << p.xi_x << "\nxi_u " << p.xi_u << "\nlmax " << line.lmax
 	    << "\nT " << p.T << "\nU0 " << p.U0 << "\ntheta " << p.theta << "\nkmc_seed " << p.kmc_seed
 	    << "\nFc " << (p.f_absolute ? "not computed" : std::to_string(Fc)) << "\nF " << line.F << std::endl;
 	if (!p.f_absolute) {

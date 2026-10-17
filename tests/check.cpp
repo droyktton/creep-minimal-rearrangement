@@ -7,7 +7,7 @@
 //  5. at T > 0, the list of all improving windows against brute force, and the cached windows
 //     against recomputing every window at every step (same kinetic Monte Carlo numbers);
 //  6. the Philox disorder: known-answer test of Philox4x32-10, mean and variance of V, and the
-//     cached band against direct generation.
+//     cached band against direct generation, and the rectangles of correlated disorder.
 #define main mr_main
 #include "../src/mr_creep.cpp"
 #undef main
@@ -184,6 +184,18 @@ int main()
 		for (int i = 0; i < p.L; i++)
 			for (int j = l.u[i] - 10; j < l.u[i] + 400; j++) bad6 += l.pot(i, j) != l.pot_raw(i, j);
 	}
-	printf("6. Philox disorder (known answer, moments, cached band): %d mismatches\n", bad6);
+	{  // rectangles: constant inside, independent between
+		Params p; p.L = 60; p.M = 0; p.xi_x = 3; p.xi_u = 5;
+		Line l(p);
+		double cn = 0, cm = 0;
+		for (int i = 0; i < p.L; i++)
+			for (int j = -50; j < 50; j++) {
+				int i0 = i / 3 * 3, j0 = (j >= 0 ? j / 5 : -((-j - 1) / 5) - 1) * 5;
+				bad6 += l.pot(i, j) != l.pot(i0, j0);
+				if (j + 5 < 50) { cn++; cm += l.pot(i, j) * l.pot(i, j + 5); }
+			}
+		if (std::abs(cm / cn) > 0.1) { bad6++; printf("rectangles: correlation at distance xi_u %g\n", cm / cn); }
+	}
+	printf("6. Philox disorder (known answer, moments, cached band, rectangles): %d mismatches\n", bad6);
 	return bad + bad2 + bad3 + bad4 + bad5 + bad6 ? 1 : 0;
 }
