@@ -43,7 +43,12 @@ Options (`build/mr_creep --help`):
 | `--save-moves` | write the time and the moved sites of every step to `moves.bin` (about 20 bytes per step) | off |
 | `--skip` | the steady state starts once the mean position has advanced by this much; the velocity is measured from there | 0 |
 | `--persistence` | T > 0: persistence and χ4 up to τ = X/v (needs `--skip`) | 0 (off) |
+| `--checkpoint` | write `checkpoint.bin` every this many seconds of wall time | 0 (never) |
+| `--walltime` | after this many seconds, or on SIGTERM, SIGINT or SIGUSR1 when checkpointing, write `checkpoint.bin` and exit with status 3 | 0 (off) |
+| `--restart` | resume from `checkpoint.bin` in `--out` if it exists; exit 0 at once if the run is already done | off |
 | `--out` | output directory | `.` |
+
+**Checkpoints.** The checkpoint holds the line, the time and the steady-state counters, the state of the Monte Carlo generator, the persistence accumulators and open origins, and the sizes of the output files. On restart the output written after the checkpoint is cut, the windows are recomputed, and the run continues exactly as if it had not stopped: the outputs are identical bit by bit. The parameters must be the same as in the run that wrote it. The checkpoint is removed when the run ends. For a batch system, run with `--restart --walltime S` in a loop, or resubmit, until the exit status is 0.
 
 Outputs:
 - `params.txt`: the parameters, F_c and F.
@@ -68,6 +73,9 @@ Outputs:
   - τ_α is defined by ⟨π(τ_α)⟩ = 1/2;
   - the grid of τ spans 10⁻³/v to X/v, where v is measured over the second half of the transient (advance `skip`/2 to `skip`).
   - Both are accumulated during the run: each origin keeps the time of the first move of every site.
+- `s4.dat` (with `--persistence`): the four-point structure factor S4(q, τ) = (1/L)⟨|Σ_i p_i(τ) e^{iqi}|²⟩ on the same grid of τ, one row per τ: τ, then S4 at each q. The second comment line lists the q = 2πn/L: n = 1 to 16, then 8 per decade up to L/2. S4(q → 0) tends to χ4 when L is much longer than the correlation length of p_i.
+
+**Correlation length.** `analysis/s4_length.py RUN_DIR ...` fits S4(q) at τ_α (or at the maximum of χ4, `--tau chi4`) to the Ornstein-Zernike form A/(1 + (qℓ)²), and also gives ℓ_half = 1/q_half with S4(q_half) = A/2. Runs that differ only in the seeds are averaged as samples of one point, with the number of origins as weight.
 
 ## Demo
 
@@ -152,7 +160,11 @@ Each step goes from a metastable state α to the next one, γ.
 - the optimal forward path between them (u'_j ≥ u_j) is computed by transfer matrix;
 - the window is a candidate if this path has a lower energy than the line.
 
-A single sweep from site i gives the optimal path of every window ℓ starting at i, at cost O(ℓ²·mcut²) up to ℓ.
+A single sweep from site i gives the optimal path of every window ℓ starting at i, at cost O(ℓ²·mcut²) up to ℓ. The sweep keeps only the heights a useful path can have, which is exact:
+- from below, the line itself, since the paths go forward;
+- from above, the heights from which a path can still come back to the end point of a later window, mcut per step.
+
+This cuts the cost about 2.6 times at ℓ_max = 100 with the same results.
 
 **2. Choice.**
 - At T = 0 the rearrangement is the candidate of the smallest ℓ [1]. Among candidates of that ℓ we take the one that lowers the energy most; ref. [1] does not specify this choice.
@@ -179,7 +191,9 @@ The method gives the sequence of metastable states and the events, not the energ
 4. the O(L) test for favourable blocks against the minimum over all blocks;
 5. at T > 0, all the candidates against brute force, and the cached against the recomputed windows with the same Monte Carlo numbers;
 6. the Philox disorder: the known answer of Philox4x32-10, the mean and variance of V, the cached band against direct generation, and the rectangles of correlated disorder;
-7. the persistence and χ4 accumulated during the run against a direct computation on random events.
+7. the persistence, χ4 and S4(q, τ) accumulated during the run against a direct computation on random events.
+
+Checkpoint and restart were checked by stopping a run 7 times (`--walltime`) and once by SIGTERM: all outputs are identical to those of the uninterrupted run.
 
 With `KRGK=path/to/krgk_creep` it also checks that F_c and the critical configuration are those of krgk-creep (both with `--rng mt`).
 
@@ -194,6 +208,7 @@ On one desktop core, 3000 steps at L = 4096 and F = 0.093 (f ≈ 0.1) take:
 Limits:
 - **Relaxation.** It still costs O(L) per elementary move (prefix sums and the test for favourable blocks). At T = 0 it dominates, and threads do not help.
 - **F_c.** Locating it needs an advance of 2M with full scans of the blocks (145 s at L = 1024, M = 4096). Give F with `--absolute` to skip it.
+- **Windows at small f.** At T > 0 a step costs about ℓ_max³: ℓ_max + extent windows are recomputed, each at cost ~ℓ_max². ℓ_max must grow with the activation size, about as f^{−3/4}. At L = 1024 and T = 0.05 the line got stuck at f = 0.01 with ℓ_max = 50 (no energy-lowering window), and ℓ_max = 100 suffices at f = 0.03.
 - **Memory.** Only with `--rng mt`, where the disorder is stored as L·M doubles (512 MB at L = 4096, M = 16384).
 
 ## References

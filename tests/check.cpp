@@ -8,7 +8,8 @@
 //     against recomputing every window at every step (same kinetic Monte Carlo numbers);
 //  6. the Philox disorder: known-answer test of Philox4x32-10, mean and variance of V, and the
 //     cached band against direct generation, and the rectangles of correlated disorder;
-//  7. the persistence and chi4 accumulated on line against a direct computation on random events.
+//  7. the persistence, chi4 and the four-point structure factor S4(q, tau) accumulated on line
+//     against a direct computation on random events.
 #define main mr_main
 #include "../src/mr_creep.cpp"
 #undef main
@@ -221,7 +222,8 @@ int main()
 		std::vector<double> origins;
 		double next = te[0];
 		for (double x : te) if (x >= next) { origins.push_back(x); next = x + 0.3; }
-		std::vector<double> S1(P.tau.size(), 0), S2(P.tau.size(), 0);
+		const size_t nq = P.modes.size();
+		std::vector<double> S1(P.tau.size(), 0), S2(P.tau.size(), 0), S4(P.tau.size() * nq, 0);
 		long n = 0;
 		for (double t0 : origins) {
 			if (t0 + 3.0 >= te.back()) break;  // not closed yet
@@ -234,12 +236,18 @@ int main()
 				for (char c : movedq) pi += !c;
 				pi /= L;
 				S1[b] += pi; S2[b] += pi * pi;
+				for (size_t m = 0; m < nq; m++) {
+					double re = 0, im = 0, q = 2 * M_PI * P.modes[m] / L;
+					for (int i = 0; i < L; i++) if (!movedq[i]) { re += std::cos(q * i); im += std::sin(q * i); }
+					S4[b * nq + m] += (re * re + im * im) / L;
+				}
 			}
 		}
 		if (n != P.n) { bad7++; printf("persistence: %ld origins, direct %ld\n", P.n, n); }
 		else for (size_t b = 0; b < P.tau.size(); b++)
 			if (std::abs(S1[b] - P.S1[b]) > 1e-9 || std::abs(S2[b] - P.S2[b]) > 1e-9) bad7++;
-		printf("7. persistence and chi4 vs direct computation: %d mismatches (%ld origins)\n", bad7, n);
+		for (size_t k = 0; k < S4.size(); k++) if (std::abs(S4[k] - P.S4[k]) > 1e-8 * (1 + S4[k])) bad7++;
+		printf("7. persistence, chi4 and S4 (%zu modes) vs direct computation: %d mismatches (%ld origins)\n", nq, bad7, n);
 	}
 	return bad + bad2 + bad3 + bad4 + bad5 + bad6 + bad7 ? 1 : 0;
 }

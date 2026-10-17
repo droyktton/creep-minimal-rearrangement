@@ -1,3 +1,5 @@
 build/
 runs/
 *.o
+pilot/*/
+pilot/*.log

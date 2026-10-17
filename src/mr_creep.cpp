@@ -37,9 +37,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <chrono>
+#include <csignal>
 #include <deque>
+#include <filesystem>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <Random123/philox.h>
@@ -69,6 +73,9 @@ struct Params {
 	bool save_moves = false;  // write the time and the moved sites (as runs) of every event to moves.bin
 	double skip = 0;          // steady state after this advance: velocity (and persistence) measured there
 	double persistence = 0;   // T > 0: persistence and chi4 up to tau = persistence / v (0: off)
+	double checkpoint = 0;    // write checkpoint.bin every this many seconds of wall time (0: never)
+	double walltime = 0;      // stop after this many seconds with a checkpoint, exit status 3 (0: off)
+	bool restart = false;     // resume from checkpoint.bin in --out if present
 	std::string out = ".";
 };
 
@@ -308,27 +315,35 @@ public:
 	// rate exp(-U(l)/T) relative to that of the smallest window, exp(-U(2)/T)
 	double rate(int l) const { return std::exp(-U0 * (std::pow((double)l, theta) - std::pow(2.0, theta)) / T); }
 
-	// smallest improving window starting at i (l = 0: none up to lmax); with all, every improving
-	// window up to lmax; with path, the optimal path of window l0
-	Window scan(int i, int l0 = 0, std::vector<int> *path = nullptr, std::vector<Window> *all = nullptr) const
+	// smallest improving window starting at i (l = 0: none up to lm, default lmax); with all,
+	// every improving window up to lm; with path, the optimal path of window l0
+	Window scan(int i, int l0 = 0, std::vector<int> *path = nullptr, std::vector<Window> *all = nullptr, int lm = 0) const
 	{
-		const int K = lmax * mcut, n = 2 * K + 1, a0 = u[i];
-		const int lend = l0 ? l0 : lmax;
+		const int lend = l0 ? l0 : (lm ? lm : lmax);
+		const int K = lend * mcut, n = 2 * K + 1, a0 = u[i];
 		std::vector<double> C(n, BIG), T(n);
 		std::vector<signed char> from(path ? (size_t)lend * n : 0);
 		C[K] = 0.0;
+		// C is finite only on [clo, chi]: the forward paths stay at or above the line, so the
+		// range follows the line from below and widens by mcut per step above. A path at step l
+		// is useful only if it can still reach the end point of a later window l' <= lend, which
+		// bounds it from above by top[l] = max_{l' >= l} (ke(l') + mcut (l' - l)) (ke: the line)
+		std::vector<int> top(lend + 1);
+		top[lend] = u[(i + lend) % L] - a0 + K;
+		for (int l = lend - 1; l >= 1; l--) top[l] = std::max(u[(i + l) % L] - a0 + K, top[l + 1] + mcut);
+		int clo = K, chi = K;
 		double cur = 0.0;  // energy of the line on the same bonds and interior sites
 		for (int l = 1; l <= lend; l++) {
 			int s = (i + l) % L, sp = (i + l - 1) % L;
 			if (l > 1) cur += site(sp, u[sp]);
 			int db = u[s] - u[sp];
 			cur += c * 0.5 * db * db;
-			int r = std::min(l * mcut, K);
-			for (int k = K - r; k <= K + r; k++) {
+			int tlo = std::max(0, clo - mcut), thi = std::min({n - 1, chi + mcut, top[l]});
+			for (int k = tlo; k <= thi; k++) {
 				double best = BIG; int arg = 0;
 				for (int d = -mcut; d <= mcut; d++) {
 					int k0 = k - d;
-					if (k0 < 0 || k0 >= n || C[k0] >= BIG) continue;
+					if (k0 < clo || k0 > chi || C[k0] >= BIG) continue;
 					double v = C[k0] + c * 0.5 * d * d;
 					if (v < best) { best = v; arg = d; }
 				}
@@ -336,17 +351,16 @@ public:
 				if (path) from[(size_t)(l - 1) * n + k] = (signed char)arg;
 			}
 			int ke = u[s] - a0 + K;
-			if (!l0 && l >= 2 && T[ke] < cur - EPS) {
+			if (!l0 && l >= 2 && ke >= tlo && ke <= thi && T[ke] < cur - EPS) {
 				if (!all) return {l, cur - T[ke]};
 				all->push_back({l, cur - T[ke]});
 			}
 			if (l == lend) break;
-			for (int k = K - r; k <= K + r; k++) {
-				int x = a0 + k - K;
-				C[k] = (T[k] >= BIG || x < u[s]) ? BIG : T[k] + site(s, x);
-			}
-			for (int k = 0; k < K - r; k++) C[k] = BIG;
-			for (int k = K + r + 1; k < n; k++) C[k] = BIG;
+			int nlo = std::max(tlo, ke);  // u'_s >= u_s
+			for (int k = clo; k <= chi; k++) C[k] = BIG;
+			for (int k = nlo; k <= thi; k++) C[k] = T[k] >= BIG ? BIG : T[k] + site(s, a0 + k - K);
+			clo = nlo; chi = thi;
+			if (clo > chi) break;  // the line rose beyond every path: no forward path left
 		}
 		if (path) {
 			int k = u[(i + lend) % L] - a0 + K;
@@ -358,8 +372,53 @@ public:
 		return {};
 	}
 
+	// candidates of the windows starting at i, up to lm
+	void candidates(int i, Candidates &C, int lm) const
+	{
+		C.w.clear(); C.R = 0;
+		if (T > 0) {
+			scan(i, 0, nullptr, &C.w, lm);
+			for (const Window &w : C.w) C.R += rate(w.l);
+		} else {
+			Window w = scan(i, 0, nullptr, nullptr, lm);
+			if (w.l) C.w.push_back(w);
+		}
+	}
+
+	// the rearrangement among the candidates cd: its start (-1 if none) and window w
+	int choose(const std::vector<Candidates> &cd, Window &w)
+	{
+		int ib = -1;
+		if (T > 0) {
+			// kinetic Monte Carlo: window i with probability R_i / R, then l with probability rate(l) / R_i
+			double R = 0;
+			for (int i = 0; i < L; i++) R += cd[i].R;
+			if (R <= 0) return -1;
+			std::uniform_real_distribution<double> uni(0.0, 1.0);
+			double x = uni(kmc) * R;
+			for (ib = 0; ib < L - 1 && (x >= cd[ib].R || cd[ib].w.empty()); ib++) x -= cd[ib].R;
+			while (cd[ib].w.empty()) ib--;  // rounding at the end of the sum
+			const auto &cw = cd[ib].w;
+			size_t k = 0;
+			for (; k + 1 < cw.size() && x >= rate(cw[k].l); k++) x -= rate(cw[k].l);
+			w = cw[k];
+			dt = -std::log(1.0 - uni(kmc)) / R;
+		} else {
+			for (int i = 0; i < L; i++) {
+				if (cd[i].w.empty()) continue;
+				const Window &c = cd[i].w[0];
+				if (ib < 0 || c.l < w.l || (c.l == w.l && c.gain > w.gain)) { ib = i; w = c; }
+			}
+		}
+		return ib;
+	}
+
+	long extended = 0;  // steps with no candidate up to lmax, taken among larger windows
+
 	// One creep step from the metastable state u. On return u is gamma and beta is the activated
-	// configuration (before relaxation). Returns the window, or l = 0 if none up to lmax.
+	// configuration (before relaxation). Returns the window, or l = 0 if no window lowers the energy.
+	// If no window up to lmax lowers the energy, this step looks for windows up to 2 lmax, 4 lmax,
+	// ... (at most L - 1): candidates beyond lmax are neglected only when smaller ones exist.
 	Window creep_step(std::vector<int> &beta)
 	{
 		rebase();
@@ -367,41 +426,20 @@ public:
 		for (int i = 0; i < L; i++) if (!valid[i]) todo.push_back(i);
 		#pragma omp parallel for schedule(dynamic, 4)
 		for (size_t t = 0; t < todo.size(); t++) {
-			Candidates &C = cand[todo[t]];
-			C.w.clear(); C.R = 0;
-			if (T > 0) {
-				scan(todo[t], 0, nullptr, &C.w);
-				for (const Window &w : C.w) C.R += rate(w.l);
-			} else {
-				Window w = scan(todo[t]);
-				if (w.l) C.w.push_back(w);
-			}
+			candidates(todo[t], cand[todo[t]], lmax);
 			valid[todo[t]] = 1;
 		}
-		int ib = -1;
 		Window w;
-		if (T > 0) {
-			// kinetic Monte Carlo: window i with probability R_i / R, then l with probability rate(l) / R_i
-			double R = 0;
-			for (int i = 0; i < L; i++) R += cand[i].R;
-			if (R <= 0) return {};
-			std::uniform_real_distribution<double> uni(0.0, 1.0);
-			double x = uni(kmc) * R;
-			for (ib = 0; ib < L - 1 && (x >= cand[ib].R || cand[ib].w.empty()); ib++) x -= cand[ib].R;
-			while (cand[ib].w.empty()) ib--;  // rounding at the end of the sum
-			const auto &cw = cand[ib].w;
-			size_t k = 0;
-			for (; k + 1 < cw.size() && x >= rate(cw[k].l); k++) x -= rate(cw[k].l);
-			w = cw[k];
-			dt = -std::log(1.0 - uni(kmc)) / R;
-		} else {
-			for (int i = 0; i < L; i++) {
-				if (cand[i].w.empty()) continue;
-				const Window &c = cand[i].w[0];
-				if (ib < 0 || c.l < w.l || (c.l == w.l && c.gain > w.gain)) { ib = i; w = c; }
-			}
-			if (ib < 0) return {};
+		int ib = choose(cand, w);
+		for (int lm = lmax; ib < 0 && lm < L - 1;) {
+			lm = std::min(2 * lm, L - 1);
+			std::vector<Candidates> ext(L);
+			#pragma omp parallel for schedule(dynamic, 4)
+			for (int i = 0; i < L; i++) candidates(i, ext[i], lm);
+			ib = choose(ext, w);
+			extended++;
 		}
+		if (ib < 0) return {};
 		std::vector<int> alpha = u;
 		scan(ib, w.l, &u);
 		beta = u;
@@ -422,30 +460,56 @@ public:
 // Persistence and four-point susceptibility of G. Russo et al., arXiv:2604.17600:
 //   pi(tau) = (1/L) sum_i p_i(tau), p_i = 1 if site i does not move in [t0, t0 + tau],
 //   averaged over origins t0 of the steady state, and chi4(tau) = L (<pi^2> - <pi>^2).
+// Its spatial resolution is the four-point structure factor
+//   S4(q, tau) = (1/L) <|sum_i p_i(tau) e^{i q i}|^2>,  q = 2 pi n / L, n = 1 .. L/2,
+// on the modes n = 1 .. 16 and then 8 per decade; S4(q -> 0) -> chi4 when the line is much
+// longer than the correlation length of p_i. For q != 0 the sum over all sites vanishes, so the
+// sum over p_i is minus the sum over the sites moved by tau, accumulated in the order of their
+// first move: O(L n_q) per origin.
 // Origins are opened every tmax/10; each keeps the time of the first move of every site after
-// t0, and is closed, adding pi and pi^2 on the grid of tau, once t > t0 + tmax.
+// t0, and is closed, adding pi, pi^2 and S4 on the grid of tau, once t > t0 + tmax.
 class Persistence {
-	int L;
-	double tmax = 0, every = 0, next = 0;
+public:
 	struct Origin { double t0; std::vector<double> first; };
-	std::deque<Origin> open;
+private:
+	int L;
+	std::vector<double> cs, sn;  // cos and sin of 2 pi k / L
 	void close(const Origin &o)
 	{
-		std::vector<double> f;
-		for (double x : o.first) if (x <= tmax) f.push_back(x);
+		std::vector<std::pair<double, int>> f;
+		for (int i = 0; i < L; i++) if (o.first[i] <= tmax) f.push_back({o.first[i], i});
 		std::sort(f.begin(), f.end());
+		const size_t nq = modes.size();
+		std::vector<double> re(nq, 0), im(nq, 0);
 		size_t k = 0;
 		for (size_t b = 0; b < tau.size(); b++) {
-			while (k < f.size() && f[k] <= tau[b]) k++;
+			for (; k < f.size() && f[k].first <= tau[b]; k++)
+				for (size_t m = 0; m < nq; m++) {
+					long x = (long)modes[m] * f[k].second % L;
+					re[m] += cs[x]; im[m] += sn[x];
+				}
 			double pi = (double)(L - (long)k) / L;
 			S1[b] += pi; S2[b] += pi * pi;
+			for (size_t m = 0; m < nq; m++) S4[b * nq + m] += (re[m] * re[m] + im[m] * im[m]) / L;
 		}
 		n++;
 	}
 public:
-	std::vector<double> tau, S1, S2;
+	double tmax = 0, every = 0, next = 0;
+	std::deque<Origin> open;
+	std::vector<int> modes;
+	std::vector<double> tau, S1, S2, S4;  // S4[b * modes.size() + m]
 	long n = 0;
-	explicit Persistence(int L) : L(L) {}
+	explicit Persistence(int L) : L(L), cs(L), sn(L)
+	{
+		for (int k = 0; k < L; k++) { cs[k] = std::cos(2 * M_PI * k / L); sn[k] = std::sin(2 * M_PI * k / L); }
+		for (int m = 1; m <= std::min(16, L / 2); m++) modes.push_back(m);
+		for (int j = 1; ; j++) {
+			int m = (int)std::lround(16 * std::pow(10.0, j / 8.0));
+			if (m > L / 2) break;
+			if (m > modes.back()) modes.push_back(m);
+		}
+	}
 	bool on() const { return tmax > 0; }
 	// tau from 1e-3 tau1 to X tau1, 60 values per log scale, origins from time t on
 	void start(double t, double tau1, double X)
@@ -453,7 +517,7 @@ public:
 		tmax = X * tau1;
 		int nb = (int)(60 * std::log10(X / 1e-3)) + 1;
 		for (int b = 0; b < nb; b++) tau.push_back(1e-3 * tau1 * std::pow(X / 1e-3, (double)b / (nb - 1)));
-		S1.assign(nb, 0); S2.assign(nb, 0);
+		S1.assign(nb, 0); S2.assign(nb, 0); S4.assign((size_t)nb * modes.size(), 0);
 		every = tmax / 10; next = t;
 	}
 	// an event at time t moved the sites in moved
@@ -465,7 +529,48 @@ public:
 		if (t >= next) { open.push_back({t, std::vector<double>(L, 2 * tmax)}); next = t + every; }
 	}
 	double chi4(size_t b) const { double m = S1[b] / n; return L * (S2[b] / n - m * m); }
+	double s4(size_t b, size_t m) const { return S4[b * modes.size() + m] / n; }
+	void save(std::ostream &o) const;
+	void load(std::istream &i);
 };
+
+// ---- checkpoint: binary dumps of numbers, vectors and strings ----
+template <class X> static void put(std::ostream &o, const X &x) { o.write((const char *)&x, sizeof x); }
+template <class X> static void put(std::ostream &o, const std::vector<X> &v)
+{
+	put(o, v.size());
+	o.write((const char *)v.data(), sizeof(X) * v.size());
+}
+static void put(std::ostream &o, const std::string &x) { put(o, x.size()); o.write(x.data(), x.size()); }
+template <class X> static void get(std::istream &i, X &x) { i.read((char *)&x, sizeof x); }
+template <class X> static void get(std::istream &i, std::vector<X> &v)
+{
+	size_t n = 0;
+	get(i, n);
+	v.resize(n);
+	i.read((char *)v.data(), sizeof(X) * n);
+}
+static void get(std::istream &i, std::string &x) { size_t n = 0; get(i, n); x.resize(n); i.read(&x[0], n); }
+
+void Persistence::save(std::ostream &o) const
+{
+	put(o, tmax); put(o, every); put(o, next); put(o, n);
+	put(o, tau); put(o, S1); put(o, S2); put(o, S4);
+	put(o, open.size());
+	for (const auto &x : open) { put(o, x.t0); put(o, x.first); }
+}
+void Persistence::load(std::istream &i)
+{
+	get(i, tmax); get(i, every); get(i, next); get(i, n);
+	get(i, tau); get(i, S1); get(i, S2); get(i, S4);
+	size_t no = 0;
+	get(i, no);
+	open.resize(no);
+	for (auto &x : open) { get(i, x.t0); get(i, x.first); }
+}
+
+static volatile std::sig_atomic_t stop_signal = 0;
+static void on_signal(int) { stop_signal = 1; }
 
 static void usage(const char *prog)
 {
@@ -492,6 +597,10 @@ static void usage(const char *prog)
 	          << "  --save-moves   write the time and the moved sites of every step to moves.bin\n"
 	          << "  --skip X       steady state after an advance X: velocity in summary.txt [0]\n"
 	          << "  --persistence X  T > 0: persistence and chi4 up to tau = X/v (needs --skip) [0: off]\n"
+	          << "  --checkpoint S write checkpoint.bin every S seconds of wall time [0: never]\n"
+	          << "  --walltime S   after S seconds (or on SIGTERM, SIGINT, SIGUSR1 if checkpointing)\n"
+	          << "                 write checkpoint.bin and exit with status 3  [0: off]\n"
+	          << "  --restart      resume from DIR/checkpoint.bin if present (exit 0 if the run is done)\n"
 	          << "  --out DIR      output directory                            [.]\n"
 	          << "Threads: OMP_NUM_THREADS.\n";
 }
@@ -529,6 +638,9 @@ int main(int argc, char **argv)
 		else if (o == "--skip") p.skip = std::stod(val());
 		else if (o == "--save-moves") p.save_moves = true;
 		else if (o == "--persistence") p.persistence = std::stod(val());
+		else if (o == "--checkpoint") p.checkpoint = std::stod(val());
+		else if (o == "--walltime") p.walltime = std::stod(val());
+		else if (o == "--restart") p.restart = true;
 		else if (o == "--out") p.out = val();
 		else { usage(argv[0]); return 1; }
 	}
@@ -543,48 +655,99 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	Line line(p);
-	// F_c costs an advance of 2M with full scans of the blocks: skipped with --absolute
-	std::vector<int> crit;
-	double Fc = 0;
-	if (!p.f_absolute) { crit.resize(p.L); Fc = line.critical_force(p.f, crit); }
-	line.F = p.f_absolute ? p.f : p.f * Fc;
-	std::fill(line.u.begin(), line.u.end(), 0);
-	line.touch_all();
-	line.relax_forward();
+	std::ostringstream pt;
+	pt << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
+	   << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed
+	   << "\nrng " << (p.philox ? "philox" : "mt") << "\nxi_x " << p.xi_x << "\nxi_u " << p.xi_u << "\nlmax " << line.lmax
+	   << "\nT " << p.T << "\nU0 " << p.U0 << "\ntheta " << p.theta << "\nkmc_seed " << p.kmc_seed
+	   << "\nevents " << p.events << "\nadvance " << p.advance << "\nskip " << p.skip << "\npersistence " << p.persistence
+	   << "\nconf_every " << p.conf_every << "\nsave_events " << p.save_events << "\nsave_moves " << p.save_moves << "\n";
+	const std::string ptxt = pt.str();
+	namespace fs = std::filesystem;
+	const std::string ckname = p.out + "/checkpoint.bin";
+	const bool resume = p.restart && fs::exists(ckname);
+	if (p.restart && !resume && fs::exists(p.out + "/summary.txt")) { std::cerr << p.out << ": already done\n"; return 0; }
 
-	std::ofstream log(p.out + "/params.txt");
-	log << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
-	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed
-	    << "\nrng " << (p.philox ? "philox" : "mt") << "\nxi_x " << p.xi_x << "\nxi_u " << p.xi_u << "\nlmax " << line.lmax
-	    << "\nT " << p.T << "\nU0 " << p.U0 << "\ntheta " << p.theta << "\nkmc_seed " << p.kmc_seed
-	    << "\nFc " << (p.f_absolute ? "not computed" : std::to_string(Fc)) << "\nF " << line.F << std::endl;
-	if (!p.f_absolute) {
-		std::ofstream o(p.out + "/critical.dat");
-		for (int v : crit) o << v << "\n";
+	// state of the run, kept in the checkpoint with the line, the Monte Carlo generator, the
+	// persistence and the sizes of the output files
+	struct State {
+		long s = 0, s_skip = 0, extended = 0;
+		double Fc = 0, F = 0, t = 0, t_half = -1, u_half = 0, t_skip = -1, u_skip = 0, u_start = 0, u_now = 0;
+	} st;
+	const std::vector<std::string> outs = {"/events.dat", "/configs.bin", "/events.bin", "/moves.bin"};
+	Persistence pers(p.L);
+	if (resume) {
+		std::ifstream in(ckname, std::ios::binary);
+		std::string magic, ptxt0, kmc;
+		get(in, magic); get(in, ptxt0);
+		if (magic != "mr_creep checkpoint 1" || ptxt0 != ptxt) { std::cerr << ckname << ": not a checkpoint of this run\n"; return 1; }
+		std::vector<long long> size;
+		get(in, st); get(in, line.u); get(in, kmc); get(in, size);
+		pers.load(in);
+		if (!in) { std::cerr << ckname << ": truncated\n"; return 1; }
+		std::istringstream(kmc) >> line.kmc;
+		line.F = st.F;
+		line.extended = st.extended;
+		// output written after the checkpoint is discarded
+		for (size_t k = 0; k < outs.size(); k++)
+			if (size[k] >= 0) fs::resize_file(p.out + outs[k], size[k]);
+		std::cerr << p.out << ": resumed at step " << st.s << "\n";
+	} else {
+		// F_c costs an advance of 2M with full scans of the blocks: skipped with --absolute
+		std::vector<int> crit;
+		if (!p.f_absolute) { crit.resize(p.L); st.Fc = line.critical_force(p.f, crit); }
+		line.F = st.F = p.f_absolute ? p.f : p.f * st.Fc;
+		std::fill(line.u.begin(), line.u.end(), 0);
+		line.touch_all();
+		line.relax_forward();
+		std::ofstream log(p.out + "/params.txt");
+		log << ptxt << "Fc " << (p.f_absolute ? "not computed" : std::to_string(st.Fc)) << "\nF " << line.F << std::endl;
+		if (!p.f_absolute) {
+			std::ofstream o(p.out + "/critical.dat");
+			for (int v : crit) o << v << "\n";
+		}
+		for (int v : line.u) st.u_start += (double)v / p.L;
+		st.u_now = st.u_start;
 	}
-	std::ofstream ev(p.out + "/events.dat");
+	const auto mode = resume ? std::ios::app : std::ios::trunc;
+	std::ofstream ev(p.out + "/events.dat", mode);
 	// dt: time of the step at T > 0, in units of exp(U(2)/T)/nu0 (0 at T = 0)
-	ev << "# step l gain L_act L_rel area mean_u E dt i x_left extent\n";
+	if (!resume) ev << "# step l gain L_act L_rel area mean_u E dt i x_left extent\n";
 	ev.precision(10);
-	std::ofstream conf, evconf;
-	if (p.conf_every > 0) conf.open(p.out + "/configs.bin", std::ios::binary);
-	if (p.save_events) evconf.open(p.out + "/events.bin", std::ios::binary);
-	std::ofstream mvf;
-	if (p.save_moves) mvf.open(p.out + "/moves.bin", std::ios::binary);
+	std::ofstream conf, evconf, mvf;
+	if (p.conf_every > 0) conf.open(p.out + "/configs.bin", std::ios::binary | mode);
+	if (p.save_events) evconf.open(p.out + "/events.bin", std::ios::binary | mode);
+	if (p.save_moves) mvf.open(p.out + "/moves.bin", std::ios::binary | mode);
+	std::vector<std::ofstream *> outf = {&ev, &conf, &evconf, &mvf};
+
+	const bool ckpt = p.checkpoint > 0 || p.walltime > 0;
+	if (ckpt) for (int sig : {SIGTERM, SIGINT, SIGUSR1}) std::signal(sig, on_signal);
+	const auto wall0 = std::chrono::steady_clock::now();
+	double next_ckpt = p.checkpoint;
+	auto write_checkpoint = [&]() {
+		std::vector<long long> size;
+		for (auto *f : outf) { f->flush(); size.push_back(f->is_open() ? (long long)f->tellp() : -1); }
+		std::ostringstream kmc;
+		kmc << line.kmc;
+		{
+			std::ofstream o(ckname + ".tmp", std::ios::binary);
+			put(o, std::string("mr_creep checkpoint 1")); put(o, ptxt);
+			put(o, st); put(o, line.u); put(o, kmc.str()); put(o, size);
+			pers.save(o);
+		}
+		fs::rename(ckname + ".tmp", ckname);
+	};
 
 	std::vector<int> alpha, beta(p.L), moved;
-	double u_start = 0;
-	for (int v : line.u) u_start += (double)v / p.L;
 	// time in units of 1/nu0: dt exp(U(2)/T)
 	const double tscale = p.T > 0 ? std::exp(p.U0 * std::pow(2.0, p.theta) / p.T) : 0.0;
 	if (!std::isfinite(tscale)) { std::cerr << "exp(U(2)/T) overflows: raise T\n"; return 1; }
-	double t = 0, t_half = -1, u_half = 0, t_skip = -1, u_skip = 0, u_now = u_start;
-	long s_skip = 0, s_last = 0;
-	Persistence pers(p.L);
-	for (long s = 1; s <= p.events; s++) {
+	bool done = p.advance > 0 && st.u_now - st.u_start >= p.advance;
+	while (!done && st.s < p.events) {
+		const long s = ++st.s;
 		alpha = line.u;
 		Line::Window w = line.creep_step(beta);
-		if (!w.l) { std::cerr << "step " << s << ": no rearrangement up to lmax = " << line.lmax << "\n"; return 2; }
+		if (!w.l) { std::cerr << "step " << s << ": no window lowers the energy\n"; return 2; }
 		// moved sites, and the smallest arc [x_left, x_left + extent) that contains them: the moved
 		// set need not be contiguous, since the optimal path can touch the line inside the window
 		moved.clear();
@@ -603,41 +766,53 @@ int main(int argc, char **argv)
 		}
 		ev << s << " " << w.l << " " << w.gain << " " << Lact << " " << Lrel << " " << area << " "
 		   << (double)sum / p.L << " " << line.energy(line.u) << " " << (p.T > 0 ? line.dt : 0.0) << " "
-		   << line.last_i << " " << x_left << " " << extent << std::endl;
+		   << line.last_i << " " << x_left << " " << extent << "\n";
 		if (p.save_events)
 			for (const auto *x : {&alpha, &beta, &line.u}) evconf.write((const char *)x->data(), sizeof(int) * p.L);
 		if (p.conf_every > 0 && s % p.conf_every == 0) conf.write((const char *)line.u.data(), sizeof(int) * p.L);
 		// time, steady state and persistence
-		t += line.dt * tscale;
-		u_now = (double)sum / p.L;
-		s_last = s;
-		if (t_half < 0 && u_now - u_start >= p.skip / 2) { t_half = t; u_half = u_now; }
-		if (t_skip < 0 && u_now - u_start >= p.skip) {
-			t_skip = t; u_skip = u_now; s_skip = s;
+		st.extended = line.extended;
+		st.t += line.dt * tscale;
+		st.u_now = (double)sum / p.L;
+		if (st.t_half < 0 && st.u_now - st.u_start >= p.skip / 2) { st.t_half = st.t; st.u_half = st.u_now; }
+		if (st.t_skip < 0 && st.u_now - st.u_start >= p.skip) {
+			st.t_skip = st.t; st.u_skip = st.u_now; st.s_skip = s;
 			if (p.persistence > 0) {
-				double v = (u_skip - u_half) / (t_skip - t_half);  // velocity over the second half of the transient
-				pers.start(t, 1.0 / v, p.persistence);
+				double v = (st.u_skip - st.u_half) / (st.t_skip - st.t_half);  // velocity over the second half of the transient
+				pers.start(st.t, 1.0 / v, p.persistence);
 			}
 		}
-		if (pers.on()) pers.event(t, moved);
+		if (pers.on()) pers.event(st.t, moved);
 		if (p.save_moves) {  // record: double time (step at T = 0), int32 n, n x (int32 start, int32 length)
 			std::vector<int32_t> runs;
 			for (size_t k = 0; k < moved.size(); k++)
 				if (k == 0 || moved[k] != moved[k - 1] + 1) { runs.push_back(moved[k]); runs.push_back(1); }
 				else runs.back()++;
-			double tt = p.T > 0 ? t : (double)s;
+			double tt = p.T > 0 ? st.t : (double)s;
 			int32_t n = (int32_t)runs.size() / 2;
 			mvf.write((const char *)&tt, sizeof tt);
 			mvf.write((const char *)&n, sizeof n);
 			mvf.write((const char *)runs.data(), sizeof(int32_t) * runs.size());
 		}
-		if (p.advance > 0 && u_now - u_start >= p.advance) break;
+		done = p.advance > 0 && st.u_now - st.u_start >= p.advance;
+		if (ckpt && !done && st.s < p.events) {
+			double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
+			bool stop = stop_signal || (p.walltime > 0 && wall >= p.walltime);
+			if (stop || (p.checkpoint > 0 && wall >= next_ckpt)) {
+				write_checkpoint();
+				next_ckpt = wall + p.checkpoint;
+				if (stop) { std::cerr << p.out << ": checkpoint at step " << s << ", stopped\n"; return 3; }
+			}
+		}
 	}
+	ev.flush();
+	const long s_last = st.s, s_skip = st.s_skip;
+	const double t = st.t, u_now = st.u_now, u_start = st.u_start, t_skip = st.t_skip, u_skip = st.u_skip;
 
 	// steady-state summary; time in units of 1/nu0 (T > 0)
 	std::ofstream sum(p.out + "/summary.txt");
 	sum.precision(10);
-	sum << "events " << s_last << "\nadvance " << u_now - u_start << "\n";
+	sum << "events " << s_last << "\nadvance " << u_now - u_start << "\nlmax_extended " << st.extended << "\n";
 	if (t_skip >= 0) {
 		sum << "steady_events " << s_last - s_skip << "\nsteady_advance " << u_now - u_skip << "\n";
 		if (p.T > 0)
@@ -660,6 +835,17 @@ int main(int argc, char **argv)
 		}
 		sum << "persistence_origins " << pers.n << "\ntau_alpha " << tau_a << "\nchi4_max " << cmax
 		    << "\ntau_chi4_max " << tau_c << "\n";
+		std::ofstream so(p.out + "/s4.dat");
+		so.precision(8);
+		so << "# four-point structure factor S4(q, tau), " << pers.n << " origins: one row per tau, columns tau S4(q_1) S4(q_2) ...\n# q";
+		for (int m : pers.modes) so << " " << 2 * M_PI * m / p.L;
+		so << "\n";
+		for (size_t b = 0; b < pers.tau.size(); b++) {
+			so << pers.tau[b];
+			for (size_t m = 0; m < pers.modes.size(); m++) so << " " << pers.s4(b, m);
+			so << "\n";
+		}
 	}
+	if (ckpt) fs::remove(ckname);
 	return 0;
 }
