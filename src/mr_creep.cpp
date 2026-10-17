@@ -1,8 +1,11 @@
-// mr_creep: T -> 0+ creep of a directed elastic line by minimal rearrangements.
+// mr_creep: creep of a directed elastic line by activated rearrangements, at T -> 0+ and at
+// finite temperature.
 //
-// Algorithm of E. E. Ferrero, L. Foini, T. Giamarchi, A. B. Kolton and A. Rosso,
+// T -> 0+: algorithm of E. E. Ferrero, L. Foini, T. Giamarchi, A. B. Kolton and A. Rosso,
 //   PRL 118, 147208 (2017), Supplemental Material: an approximation of the exact transition
 //   pathways of A. B. Kolton, A. Rosso, T. Giamarchi and W. Krauth, PRB 79, 184207 (2009).
+// T > 0: its extension by G. Russo, E. E. Ferrero, A. B. Kolton, A. Rosso and D. Vandembroucq,
+//   arXiv:2604.17600 (2026), a kinetic Monte Carlo over all the energy-lowering rearrangements.
 //
 // Model: u_i integer, i = 0..L-1 periodic, u_i in a random potential periodic in u with period M,
 //   E = sum_i [ V(i, u_i mod M) - F u_i + (c/2) (u_{i+1} - u_i)^2 ],  |u_{i+1} - u_i| <= mcut.
@@ -13,11 +16,17 @@
 //     [i, i+l] the end points u_i, u_{i+l} are kept fixed and the optimal path between them is
 //     computed (forward: u'_j >= u_j); the rearrangement is the one of the smallest l for which
 //     the optimal path has a lower energy than the line. Among windows of that l the one that
-//     lowers the energy most is taken. The windows are independent: they are computed in
-//     parallel (OpenMP) and, after a step, only the windows that touch the moved sites again.
+//     lowers the energy most is taken.
+//     At T > 0 every window [i, i+l], l <= lmax, whose optimal path lowers the energy is a
+//     candidate, with the barrier U(l) = U0 l^theta and the rate exp(-U(l)/T); one candidate is
+//     drawn with probability proportional to its rate (kinetic Monte Carlo) and the time
+//     advances by -ln(r)/R, R the total rate.
+//     The windows are independent: they are computed in parallel (OpenMP) and, after a step,
+//     only the windows that touch the moved sites are computed again.
 // (ii) deterministic relaxation: forward elementary moves (rigid displacement by +1 of a block
 //     of consecutive sites), the shortest favourable block first, as in krgk_creep.
-// The method gives the sequence of metastable states and the events, not the energy barriers.
+// The method gives the sequence of metastable states and the events, not the energy barriers;
+// at T > 0 the time follows from the assumed barriers U(l).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -42,7 +51,10 @@ struct Params {
 	unsigned long seed = 12345;
 	long events = 100;
 	double advance = 0;       // stop earlier, once the mean position has advanced by this much
-	int lmax = 0;             // largest window (0: L - 1)
+	int lmax = 0;             // largest window (0: L - 1 at T = 0, min(50, L - 1) at T > 0)
+	double T = 0;             // temperature (0: the T -> 0+ limit)
+	double U0 = 1.0, theta = 1.0 / 3.0;  // barrier of a rearrangement of window l: U0 l^theta
+	unsigned long kmc_seed = 1;          // random numbers of the kinetic Monte Carlo
 	int conf_every = 0;       // write the metastable configuration every n events (0: never)
 	bool save_events = false; // write alpha, the activated configuration and gamma of every event
 	std::string out = ".";
@@ -76,12 +88,16 @@ class Line {
 public:
 	int L, M, mcut, lmax;
 	double c, F = 0.0;
+	double T, U0, theta;
+	std::mt19937_64 kmc;
 	std::vector<double> V;  // V[i*M + j]
 	std::vector<int> u;
 
-	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut), lmax(p.lmax > 0 ? p.lmax : p.L - 1), c(p.c),
+	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut),
+		lmax(p.lmax > 0 ? p.lmax : (p.T > 0 ? std::min(50, p.L - 1) : p.L - 1)), c(p.c),
+		T(p.T), U0(p.U0), theta(p.theta), kmc(p.kmc_seed),
 		V((size_t)p.L * p.M), u(p.L, 0), dirty(p.L, 1), ds(p.L), P(2 * p.L + 1), D(2 * p.L + 1),
-		win(p.L), valid(p.L, 0)
+		cand(p.L), valid(p.L, 0)
 	{
 		Random rng(p.seed);
 		for (auto &v : V) v = rng.gauss();
@@ -215,12 +231,20 @@ public:
 	// lowest energy of the bonds i .. i+j and of the sites i+1 .. i+j-1, with u'_{i+j} = u_i + k
 	// and u'_s >= u_s. The window [i, i+l] improves if C[u_{i+l} - u_i] (end point fixed) is below
 	// the energy of the line on the same bonds and sites. Cost O(l^2 mcut^2) up to window l.
-	struct Window { int l = 0; double gain = 0; };  // smallest improving window from i (l = 0: none up to lmax)
-	std::vector<Window> win;
+	struct Window { int l = 0; double gain = 0; };
+	// candidates of the windows starting at i: at T = 0 the smallest improving window (none if no
+	// window up to lmax improves), at T > 0 all of them; R is the sum of their rates
+	struct Candidates { std::vector<Window> w; double R = 0; };
+	std::vector<Candidates> cand;
 	std::vector<char> valid;
+	double dt = 0;  // time of the last step (T > 0), in units of exp(U(2)/T)/nu0
 
-	// smallest improving window starting at i; with path, also the optimal path of window l0
-	Window scan(int i, int l0 = 0, std::vector<int> *path = nullptr) const
+	// rate exp(-U(l)/T) relative to that of the smallest window, exp(-U(2)/T)
+	double rate(int l) const { return std::exp(-U0 * (std::pow((double)l, theta) - std::pow(2.0, theta)) / T); }
+
+	// smallest improving window starting at i (l = 0: none up to lmax); with all, every improving
+	// window up to lmax; with path, the optimal path of window l0
+	Window scan(int i, int l0 = 0, std::vector<int> *path = nullptr, std::vector<Window> *all = nullptr) const
 	{
 		const int K = lmax * mcut, n = 2 * K + 1, a0 = u[i];
 		const int lend = l0 ? l0 : lmax;
@@ -246,7 +270,10 @@ public:
 				if (path) from[(size_t)(l - 1) * n + k] = (signed char)arg;
 			}
 			int ke = u[s] - a0 + K;
-			if (!l0 && l >= 2 && T[ke] < cur - EPS) return {l, cur - T[ke]};
+			if (!l0 && l >= 2 && T[ke] < cur - EPS) {
+				if (!all) return {l, cur - T[ke]};
+				all->push_back({l, cur - T[ke]});
+			}
 			if (l == lend) break;
 			for (int k = K - r; k <= K + r; k++) {
 				int x = a0 + k - K;
@@ -272,15 +299,42 @@ public:
 		std::vector<int> todo;
 		for (int i = 0; i < L; i++) if (!valid[i]) todo.push_back(i);
 		#pragma omp parallel for schedule(dynamic, 4)
-		for (size_t t = 0; t < todo.size(); t++) { win[todo[t]] = scan(todo[t]); valid[todo[t]] = 1; }
-		int ib = -1;
-		for (int i = 0; i < L; i++) {
-			const Window &w = win[i];
-			if (!w.l) continue;
-			if (ib < 0 || w.l < win[ib].l || (w.l == win[ib].l && w.gain > win[ib].gain)) ib = i;
+		for (size_t t = 0; t < todo.size(); t++) {
+			Candidates &C = cand[todo[t]];
+			C.w.clear(); C.R = 0;
+			if (T > 0) {
+				scan(todo[t], 0, nullptr, &C.w);
+				for (const Window &w : C.w) C.R += rate(w.l);
+			} else {
+				Window w = scan(todo[t]);
+				if (w.l) C.w.push_back(w);
+			}
+			valid[todo[t]] = 1;
 		}
-		if (ib < 0) return {};
-		Window w = win[ib];
+		int ib = -1;
+		Window w;
+		if (T > 0) {
+			// kinetic Monte Carlo: window i with probability R_i / R, then l with probability rate(l) / R_i
+			double R = 0;
+			for (int i = 0; i < L; i++) R += cand[i].R;
+			if (R <= 0) return {};
+			std::uniform_real_distribution<double> uni(0.0, 1.0);
+			double x = uni(kmc) * R;
+			for (ib = 0; ib < L - 1 && (x >= cand[ib].R || cand[ib].w.empty()); ib++) x -= cand[ib].R;
+			while (cand[ib].w.empty()) ib--;  // rounding at the end of the sum
+			const auto &cw = cand[ib].w;
+			size_t k = 0;
+			for (; k + 1 < cw.size() && x >= rate(cw[k].l); k++) x -= rate(cw[k].l);
+			w = cw[k];
+			dt = -std::log(1.0 - uni(kmc)) / R;
+		} else {
+			for (int i = 0; i < L; i++) {
+				if (cand[i].w.empty()) continue;
+				const Window &c = cand[i].w[0];
+				if (ib < 0 || c.l < w.l || (c.l == w.l && c.gain > w.gain)) { ib = i; w = c; }
+			}
+			if (ib < 0) return {};
+		}
 		std::vector<int> alpha = u;
 		scan(ib, w.l, &u);
 		beta = u;
@@ -290,7 +344,7 @@ public:
 		std::vector<int> moved(2 * L + 1, 0);
 		for (int s = 0; s < 2 * L; s++) moved[s + 1] = moved[s] + (u[s % L] != alpha[s % L]);
 		for (int i = 0; i < L; i++) {
-			int reach = win[i].l ? win[i].l : lmax;
+			int reach = (T == 0 && !cand[i].w.empty()) ? cand[i].w[0].l : lmax;
 			if (moved[i + reach + 1] - moved[i] > 0) valid[i] = 0;
 		}
 		return w;
@@ -310,7 +364,11 @@ static void usage(const char *prog)
 	          << "  --seed N       random seed                                 [12345]\n"
 	          << "  --events N     number of creep steps                       [100]\n"
 	          << "  --advance X    stop once the mean position advanced by X   [0: off]\n"
-	          << "  --lmax N       largest rearrangement window                [L-1]\n"
+	          << "  --lmax N       largest rearrangement window        [L-1; at T > 0: 50]\n"
+	          << "  --T X          temperature (0: the T -> 0+ limit)          [0]\n"
+	          << "  --U0 X         barrier prefactor, U(l) = U0 l^theta        [1]\n"
+	          << "  --theta X      barrier exponent                            [1/3]\n"
+	          << "  --kmc-seed N   seed of the kinetic Monte Carlo             [1]\n"
 	          << "  --conf-every N write the metastable state every N steps    [0: never]\n"
 	          << "  --save-events  write alpha, activated and gamma of every step to events.bin\n"
 	          << "  --out DIR      output directory                            [.]\n"
@@ -334,6 +392,10 @@ int main(int argc, char **argv)
 		else if (o == "--events") p.events = std::stol(val());
 		else if (o == "--advance") p.advance = std::stod(val());
 		else if (o == "--lmax") p.lmax = std::stoi(val());
+		else if (o == "--T") p.T = std::stod(val());
+		else if (o == "--U0") p.U0 = std::stod(val());
+		else if (o == "--theta") p.theta = std::stod(val());
+		else if (o == "--kmc-seed") p.kmc_seed = std::stoul(val());
 		else if (o == "--conf-every") p.conf_every = std::stoi(val());
 		else if (o == "--save-events") p.save_events = true;
 		else if (o == "--out") p.out = val();
@@ -355,13 +417,15 @@ int main(int argc, char **argv)
 	std::ofstream log(p.out + "/params.txt");
 	log << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
 	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed << "\nlmax " << line.lmax
+	    << "\nT " << p.T << "\nU0 " << p.U0 << "\ntheta " << p.theta << "\nkmc_seed " << p.kmc_seed
 	    << "\nFc " << (p.f_absolute ? "not computed" : std::to_string(Fc)) << "\nF " << line.F << std::endl;
 	if (!p.f_absolute) {
 		std::ofstream o(p.out + "/critical.dat");
 		for (int v : crit) o << v << "\n";
 	}
 	std::ofstream ev(p.out + "/events.dat");
-	ev << "# step l gain L_act L_rel area mean_u E\n";
+	// dt: time of the step at T > 0, in units of exp(U(2)/T)/nu0 (0 at T = 0)
+	ev << "# step l gain L_act L_rel area mean_u E dt\n";
 	ev.precision(10);
 	std::ofstream conf, evconf;
 	if (p.conf_every > 0) conf.open(p.out + "/configs.bin", std::ios::binary);
@@ -383,7 +447,7 @@ int main(int argc, char **argv)
 			sum += line.u[i];
 		}
 		ev << s << " " << w.l << " " << w.gain << " " << Lact << " " << Lrel << " " << area << " "
-		   << (double)sum / p.L << " " << line.energy(line.u) << std::endl;
+		   << (double)sum / p.L << " " << line.energy(line.u) << " " << (p.T > 0 ? line.dt : 0.0) << std::endl;
 		if (p.save_events)
 			for (const auto *x : {&alpha, &beta, &line.u}) evconf.write((const char *)x->data(), sizeof(int) * p.L);
 		if (p.conf_every > 0 && s % p.conf_every == 0) conf.write((const char *)line.u.data(), sizeof(int) * p.L);

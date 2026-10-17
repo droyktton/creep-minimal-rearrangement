@@ -3,7 +3,9 @@
 //  2. the fast relaxation (prefix sums, skipping clean blocks) against the plain scan of
 //     krgk_creep over all blocks, from the same activated configurations;
 //  3. the cached windows against recomputing every window at every step;
-//  4. the O(L) lowest block-move energy against the minimum over all blocks.
+//  4. the O(L) lowest block-move energy against the minimum over all blocks;
+//  5. at T > 0, the list of all improving windows against brute force, and the cached windows
+//     against recomputing every window at every step (same kinetic Monte Carlo numbers).
 #define main mr_main
 #include "../src/mr_creep.cpp"
 #undef main
@@ -124,5 +126,41 @@ int main()
 	printf("2. fast vs plain relaxation: %d mismatches\n", bad2);
 	printf("3. cached vs recomputed windows: %d mismatches\n", bad3);
 	printf("4. lowest block move, O(L) vs all blocks: %d mismatches\n", bad4);
-	return bad + bad2 + bad3 + bad4 ? 1 : 0;
+
+	int bad5 = 0, cands = 0, steps5 = 0;
+	for (unsigned long seed = 1; seed <= 4; seed++) {
+		Params p; p.L = 24; p.M = 64; p.mcut = 1 + seed % 2; p.seed = seed; p.lmax = 9; p.f = 0.5;
+		p.T = 0.3 * seed; p.kmc_seed = seed;
+		Line a(p), b(p);
+		std::vector<int> crit(p.L), ba(p.L), bb(p.L);
+		double Fc = a.critical_force(p.f, crit);
+		a.F = b.F = p.f * Fc;
+		std::fill(a.u.begin(), a.u.end(), 0);
+		a.touch_all(); a.relax_forward();
+		b.u = a.u;
+		for (int step = 0; step < 40; step++) {
+			for (int i = 0; i < p.L; i++) {
+				std::vector<Line::Window> all;
+				a.scan(i, 0, nullptr, &all);
+				std::vector<int> lb;
+				for (int ww = 2; ww <= p.lmax; ww++) {
+					double cur = 0;
+					for (int k = 1; k < ww; k++) cur += a.site((i + k) % p.L, a.u[(i + k) % p.L]);
+					for (int k = 0; k < ww; k++) { int d = a.u[(i + k + 1) % p.L] - a.u[(i + k) % p.L]; cur += a.c * 0.5 * d * d; }
+					std::vector<int> x = a.u;
+					if (brute(a, i, ww, x, 1, BIG) < cur - EPS) lb.push_back(ww);
+				}
+				cands += all.size();
+				if (all.size() != lb.size()) bad5++;
+				else for (size_t k = 0; k < lb.size(); k++) bad5 += all[k].l != lb[k];
+			}
+			std::fill(b.valid.begin(), b.valid.end(), 0);
+			Line::Window wa = a.creep_step(ba), wb = b.creep_step(bb);
+			if (!wa.l) break;
+			steps5++;
+			if (wa.l != wb.l || a.u != b.u || a.dt != b.dt) { bad5++; break; }
+		}
+	}
+	printf("5. T > 0: candidates vs brute force and cached vs recomputed: %d mismatches (%d steps, %d candidates)\n", bad5, steps5, cands);
+	return bad + bad2 + bad3 + bad4 + bad5 ? 1 : 0;
 }
