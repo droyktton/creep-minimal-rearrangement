@@ -1,0 +1,393 @@
+// mr_creep: T -> 0+ creep of a directed elastic line by minimal rearrangements.
+//
+// Algorithm of E. E. Ferrero, L. Foini, T. Giamarchi, A. B. Kolton and A. Rosso,
+//   PRL 118, 147208 (2017), Supplemental Material: an approximation of the exact transition
+//   pathways of A. B. Kolton, A. Rosso, T. Giamarchi and W. Krauth, PRB 79, 184207 (2009).
+//
+// Model: u_i integer, i = 0..L-1 periodic, u_i in a random potential periodic in u with period M,
+//   E = sum_i [ V(i, u_i mod M) - F u_i + (c/2) (u_{i+1} - u_i)^2 ],  |u_{i+1} - u_i| <= mcut.
+// Same energy, disorder and random numbers as krgk_creep, so both codes see the same sample.
+//
+// Each creep step goes from a metastable state alpha to the next one, gamma, in two steps:
+// (i) activation: the smallest compact rearrangement that lowers the energy. For every window
+//     [i, i+l] the end points u_i, u_{i+l} are kept fixed and the optimal path between them is
+//     computed (forward: u'_j >= u_j); the rearrangement is the one of the smallest l for which
+//     the optimal path has a lower energy than the line. Among windows of that l the one that
+//     lowers the energy most is taken. The windows are independent: they are computed in
+//     parallel (OpenMP) and, after a step, only the windows that touch the moved sites again.
+// (ii) deterministic relaxation: forward elementary moves (rigid displacement by +1 of a block
+//     of consecutive sites), the shortest favourable block first, as in krgk_creep.
+// The method gives the sequence of metastable states and the events, not the energy barriers.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+static const double BIG = 1e300;
+static const double PRECISION_FC = 0.005;  // step in F when locating F_c (as in krgk_creep)
+static const double EPS = 1e-9;            // smallest energy gain accepted
+
+struct Params {
+	int L = 64, M = 1024, mcut = 1;
+	double disorder = 1.0, c = 2.0, f = 0.5;
+	bool f_absolute = false;
+	unsigned long seed = 12345;
+	long events = 100;
+	double advance = 0;       // stop earlier, once the mean position has advanced by this much
+	int lmax = 0;             // largest window (0: L - 1)
+	int conf_every = 0;       // write the metastable configuration every n events (0: never)
+	bool save_events = false; // write alpha, the activated configuration and gamma of every event
+	std::string out = ".";
+};
+
+// Mersenne Twister and Gaussian deviates as in krgk_creep (and the original code):
+// genrand_real3 in (0,1) and the polar Box-Muller of Numerical Recipes.
+class Random {
+	std::mt19937 mt;
+	bool have = false;
+	double saved = 0.0;
+	double real3() { return ((double)mt() + 0.5) * (1.0 / 4294967296.0); }
+public:
+	explicit Random(unsigned long s) : mt((uint32_t)s) {}
+	double gauss()
+	{
+		if (have) { have = false; return saved; }
+		double v1, v2, r2;
+		do {
+			v1 = 2.0 * real3() - 1.0;
+			v2 = 2.0 * real3() - 1.0;
+			r2 = v1 * v1 + v2 * v2;
+		} while (r2 >= 1.0 || r2 == 0.0);
+		double fac = std::sqrt(-2.0 * std::log(r2) / r2);
+		saved = v1 * fac; have = true;
+		return v2 * fac;
+	}
+};
+
+class Line {
+public:
+	int L, M, mcut, lmax;
+	double c, F = 0.0;
+	std::vector<double> V;  // V[i*M + j]
+	std::vector<int> u;
+
+	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut), lmax(p.lmax > 0 ? p.lmax : p.L - 1), c(p.c),
+		V((size_t)p.L * p.M), u(p.L, 0), dirty(p.L, 1), ds(p.L), P(2 * p.L + 1), D(2 * p.L + 1),
+		win(p.L), valid(p.L, 0)
+	{
+		Random rng(p.seed);
+		for (auto &v : V) v = rng.gauss();
+		double mean = 0.0;
+		for (double v : V) mean += v;
+		mean /= V.size();
+		for (auto &v : V) v = (v - mean) * p.disorder;
+	}
+
+	double pot(int i, int j) const { int m = j % M; if (m < 0) m += M; return V[(size_t)i * M + m]; }
+	double site(int i, int x) const { return pot(i, x) - F * x; }
+
+	double energy(const std::vector<int> &x) const
+	{
+		double E = 0.0;
+		for (int i = 0; i < L; i++) {
+			int d = x[i + 1 == L ? 0 : i + 1] - x[i];
+			E = E + site(i, x[i]) + c * 0.5 * d * d;
+		}
+		return E;
+	}
+
+	// ---- deterministic relaxation (elementary moves) ----
+	// A block move (i, il) displaces sites i+1 .. i+il-1 by dir with sites i and i+il fixed
+	// (il = 2..L); il = L+1 is the rigid move of the whole line. Same moves and order as
+	// krgk_creep: the first favourable move in the order (il, i) is applied. Block energies come
+	// from prefix sums of the site terms; blocks that touch no site changed since the last
+	// metastable state (dirty) cannot have become favourable and are skipped.
+	std::vector<char> dirty;
+	std::vector<double> ds, P;  // site-term change of each site, and its prefix sums (2L)
+	std::vector<int> D;         // prefix counts of dirty sites (2L)
+	int pdir = 0;
+
+	void touch_all() { std::fill(dirty.begin(), dirty.end(), 1); }
+
+	void prefix(int dir)
+	{
+		for (int s = 0; s < L; s++) ds[s] = site(s, u[s] + dir) - site(s, u[s]);
+		P[0] = 0; D[0] = 0;
+		for (int s = 0; s < 2 * L; s++) { P[s + 1] = P[s] + ds[s % L]; D[s + 1] = D[s] + dirty[s % L]; }
+		pdir = dir;
+	}
+
+	// Lowest energy change over all block moves (i, il), 2 <= il <= L, and the rigid move, in O(L).
+	// With e = i + il the energy change is separable, d = A(i) + B(e):
+	//   A(i) = c (1 + dir (u_{i+1} - u_i)) - P[i+1],  B(e) = c dir (u_{e-1} - u_e) + P[e],
+	// each term defined only if its border slope stays within mcut; the minimum over
+	// e in [i+2, i+L] is a sliding-window minimum.
+	double lowest_move(int dir) const
+	{
+		auto at = [&](int s) { return u[s % L]; };
+		std::vector<double> B(2 * L);
+		for (int e = 2; e < 2 * L; e++)
+			B[e] = std::abs(at(e - 1) + dir - at(e)) > mcut ? BIG : c * dir * (at(e - 1) - at(e)) + P[e];
+		double best = P[L];
+		std::vector<int> q(2 * L);  // deque of indices e with increasing B
+		int h = 0, t = 0, next = 2;
+		for (int i = 0; i < L; i++) {
+			for (; next <= i + L; next++) {
+				while (t > h && B[q[t - 1]] >= B[next]) t--;
+				q[t++] = next;
+			}
+			while (q[h] < i + 2) h++;
+			if (std::abs(at(i + 1) + dir - u[i]) > mcut || B[q[h]] >= BIG) continue;
+			best = std::min(best, c * (1.0 + dir * (at(i + 1) - u[i])) - P[i + 1] + B[q[h]]);
+		}
+		return best;
+	}
+
+	// One elementary move in direction dir. Returns the smallest energy change per moved site
+	// among the moves tried (all moves if full); it is negative if and only if a move was made.
+	double move(int dir, bool full)
+	{
+		prefix(dir);
+		if (!full && (D[L] == 0 || lowest_move(dir) > 1e-9)) return BIG;  // no favourable move
+		double dmin = BIG;
+		for (int il = 2; il <= L + 1; il++) {
+			int nstart = (il <= L) ? L : 1;
+			for (int i = 0; i < nstart; i++) {
+				double d;
+				if (il <= L) {
+					if (!full && D[i + il + 1] - D[i] == 0) continue;  // sites i .. i+il clean
+					int istop = (i + il) % L, a = u[(i + 1) % L], b = u[(istop - 1 + L) % L];
+					if (std::abs(a + dir - u[i]) > mcut || std::abs(b + dir - u[istop]) > mcut) continue;
+					d = c * (1.0 + dir * (a - u[i] + b - u[istop])) + P[i + il] - P[i + 1];
+				} else d = P[L];
+				dmin = std::min(dmin, d / (il - 1));
+				if (d < 0) {
+					int n = (il <= L) ? il - 1 : L;
+					for (int j = 1; j <= n; j++) { int s = (i + j) % L; u[s] += dir; dirty[s] = 1; }
+					if (il <= L) { dirty[i] = 1; dirty[(i + il) % L] = 1; }
+					return dmin;
+				}
+			}
+		}
+		return dmin;
+	}
+
+	void relax_forward()
+	{
+		while (move(+1, false) < 0.0) {}
+		std::fill(dirty.begin(), dirty.end(), 0);  // metastable: no favourable move left
+	}
+
+	// Critical force with the procedure of krgk_creep (find_critical of the original): starting
+	// from u = 0 and the initial F, relax backward; then advance forward by 2M, raising F by
+	// (dmin + PRECISION_FC) whenever no forward move lowers the energy. F_c = F - PRECISION_FC.
+	// The critical configuration (crit) is the one that blocked the line at the last raise of F.
+	double critical_force(double F0, std::vector<int> &crit)
+	{
+		F = F0;
+		std::fill(u.begin(), u.end(), 0);
+		while (move(-1, true) < 0.0) {}
+		F -= 5.0 * PRECISION_FC;
+		int count = 0;
+		while (count == 0) {
+			std::vector<int> u0 = u;
+			auto advanced = [&]() { int m = u[0] - u0[0]; for (int i = 1; i < L; i++) m = std::min(m, u[i] - u0[i]); return m; };
+			while (advanced() < 2 * M) {
+				double d = move(+1, true);
+				if (d >= 0.0) { F += d + PRECISION_FC; count++; crit = u; }
+			}
+			if (count == 0) { F -= 5.0 * PRECISION_FC; for (auto &x : u) x -= 2 * M; }
+		}
+		touch_all();
+		return F - PRECISION_FC;
+	}
+
+	// ---- activation: minimal rearrangement ----
+	// Optimal forward path from site i (u'_i = u_i) by transfer matrix: after j steps, C[k] is the
+	// lowest energy of the bonds i .. i+j and of the sites i+1 .. i+j-1, with u'_{i+j} = u_i + k
+	// and u'_s >= u_s. The window [i, i+l] improves if C[u_{i+l} - u_i] (end point fixed) is below
+	// the energy of the line on the same bonds and sites. Cost O(l^2 mcut^2) up to window l.
+	struct Window { int l = 0; double gain = 0; };  // smallest improving window from i (l = 0: none up to lmax)
+	std::vector<Window> win;
+	std::vector<char> valid;
+
+	// smallest improving window starting at i; with path, also the optimal path of window l0
+	Window scan(int i, int l0 = 0, std::vector<int> *path = nullptr) const
+	{
+		const int K = lmax * mcut, n = 2 * K + 1, a0 = u[i];
+		const int lend = l0 ? l0 : lmax;
+		std::vector<double> C(n, BIG), T(n);
+		std::vector<signed char> from(path ? (size_t)lend * n : 0);
+		C[K] = 0.0;
+		double cur = 0.0;  // energy of the line on the same bonds and interior sites
+		for (int l = 1; l <= lend; l++) {
+			int s = (i + l) % L, sp = (i + l - 1) % L;
+			if (l > 1) cur += site(sp, u[sp]);
+			int db = u[s] - u[sp];
+			cur += c * 0.5 * db * db;
+			int r = std::min(l * mcut, K);
+			for (int k = K - r; k <= K + r; k++) {
+				double best = BIG; int arg = 0;
+				for (int d = -mcut; d <= mcut; d++) {
+					int k0 = k - d;
+					if (k0 < 0 || k0 >= n || C[k0] >= BIG) continue;
+					double v = C[k0] + c * 0.5 * d * d;
+					if (v < best) { best = v; arg = d; }
+				}
+				T[k] = best;
+				if (path) from[(size_t)(l - 1) * n + k] = (signed char)arg;
+			}
+			int ke = u[s] - a0 + K;
+			if (!l0 && l >= 2 && T[ke] < cur - EPS) return {l, cur - T[ke]};
+			if (l == lend) break;
+			for (int k = K - r; k <= K + r; k++) {
+				int x = a0 + k - K;
+				C[k] = (T[k] >= BIG || x < u[s]) ? BIG : T[k] + site(s, x);
+			}
+			for (int k = 0; k < K - r; k++) C[k] = BIG;
+			for (int k = K + r + 1; k < n; k++) C[k] = BIG;
+		}
+		if (path) {
+			int k = u[(i + lend) % L] - a0 + K;
+			for (int l = lend; l >= 1; l--) {
+				k -= from[(size_t)(l - 1) * n + k];
+				if (l > 1) (*path)[(i + l - 1) % L] = a0 + k - K;
+			}
+		}
+		return {};
+	}
+
+	// One creep step from the metastable state u. On return u is gamma and beta is the activated
+	// configuration (before relaxation). Returns the window, or l = 0 if none up to lmax.
+	Window creep_step(std::vector<int> &beta)
+	{
+		std::vector<int> todo;
+		for (int i = 0; i < L; i++) if (!valid[i]) todo.push_back(i);
+		#pragma omp parallel for schedule(dynamic, 4)
+		for (size_t t = 0; t < todo.size(); t++) { win[todo[t]] = scan(todo[t]); valid[todo[t]] = 1; }
+		int ib = -1;
+		for (int i = 0; i < L; i++) {
+			const Window &w = win[i];
+			if (!w.l) continue;
+			if (ib < 0 || w.l < win[ib].l || (w.l == win[ib].l && w.gain > win[ib].gain)) ib = i;
+		}
+		if (ib < 0) return {};
+		Window w = win[ib];
+		std::vector<int> alpha = u;
+		scan(ib, w.l, &u);
+		beta = u;
+		for (int s = 0; s < L; s++) dirty[s] = u[s] != alpha[s];
+		relax_forward();
+		// invalidate the windows [i, i + reach] that contain a moved site
+		std::vector<int> moved(2 * L + 1, 0);
+		for (int s = 0; s < 2 * L; s++) moved[s + 1] = moved[s] + (u[s % L] != alpha[s % L]);
+		for (int i = 0; i < L; i++) {
+			int reach = win[i].l ? win[i].l : lmax;
+			if (moved[i + reach + 1] - moved[i] > 0) valid[i] = 0;
+		}
+		return w;
+	}
+};
+
+static void usage(const char *prog)
+{
+	std::cerr << "usage: " << prog << " [options]\n"
+	          << "  --L N          line length (sites, periodic)                [64]\n"
+	          << "  --M N          period of the disorder along u              [1024]\n"
+	          << "  --mcut N       maximal slope |u_{i+1}-u_i|                 [1]\n"
+	          << "  --disorder X   disorder strength (Gaussian, std X)         [1.0]\n"
+	          << "  --c X          elastic constant                            [2.0]\n"
+	          << "  --f X          drive F/F_c (or F with --absolute)          [0.5]\n"
+	          << "  --absolute     --f is the absolute force F (F_c is then not computed)\n"
+	          << "  --seed N       random seed                                 [12345]\n"
+	          << "  --events N     number of creep steps                       [100]\n"
+	          << "  --advance X    stop once the mean position advanced by X   [0: off]\n"
+	          << "  --lmax N       largest rearrangement window                [L-1]\n"
+	          << "  --conf-every N write the metastable state every N steps    [0: never]\n"
+	          << "  --save-events  write alpha, activated and gamma of every step to events.bin\n"
+	          << "  --out DIR      output directory                            [.]\n"
+	          << "Threads: OMP_NUM_THREADS.\n";
+}
+
+int main(int argc, char **argv)
+{
+	Params p;
+	for (int a = 1; a < argc; a++) {
+		std::string o = argv[a];
+		auto val = [&]() { if (a + 1 >= argc) { usage(argv[0]); std::exit(1); } return std::string(argv[++a]); };
+		if (o == "--L") p.L = std::stoi(val());
+		else if (o == "--M") p.M = std::stoi(val());
+		else if (o == "--mcut") p.mcut = std::stoi(val());
+		else if (o == "--disorder") p.disorder = std::stod(val());
+		else if (o == "--c") p.c = std::stod(val());
+		else if (o == "--f") p.f = std::stod(val());
+		else if (o == "--absolute") p.f_absolute = true;
+		else if (o == "--seed") p.seed = std::stoul(val());
+		else if (o == "--events") p.events = std::stol(val());
+		else if (o == "--advance") p.advance = std::stod(val());
+		else if (o == "--lmax") p.lmax = std::stoi(val());
+		else if (o == "--conf-every") p.conf_every = std::stoi(val());
+		else if (o == "--save-events") p.save_events = true;
+		else if (o == "--out") p.out = val();
+		else { usage(argv[0]); return 1; }
+	}
+	if (p.L < 3 || p.M < 2 || p.mcut < 1) { std::cerr << "need L >= 3, M >= 2, mcut >= 1\n"; return 1; }
+	if (p.lmax >= p.L) { std::cerr << "need lmax < L\n"; return 1; }
+
+	Line line(p);
+	// F_c costs an advance of 2M with full scans of the blocks: skipped with --absolute
+	std::vector<int> crit;
+	double Fc = 0;
+	if (!p.f_absolute) { crit.resize(p.L); Fc = line.critical_force(p.f, crit); }
+	line.F = p.f_absolute ? p.f : p.f * Fc;
+	std::fill(line.u.begin(), line.u.end(), 0);
+	line.touch_all();
+	line.relax_forward();
+
+	std::ofstream log(p.out + "/params.txt");
+	log << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
+	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed << "\nlmax " << line.lmax
+	    << "\nFc " << (p.f_absolute ? "not computed" : std::to_string(Fc)) << "\nF " << line.F << std::endl;
+	if (!p.f_absolute) {
+		std::ofstream o(p.out + "/critical.dat");
+		for (int v : crit) o << v << "\n";
+	}
+	std::ofstream ev(p.out + "/events.dat");
+	ev << "# step l gain L_act L_rel area mean_u E\n";
+	ev.precision(10);
+	std::ofstream conf, evconf;
+	if (p.conf_every > 0) conf.open(p.out + "/configs.bin", std::ios::binary);
+	if (p.save_events) evconf.open(p.out + "/events.bin", std::ios::binary);
+
+	std::vector<int> alpha, beta(p.L);
+	double u_start = 0;
+	for (int v : line.u) u_start += (double)v / p.L;
+	for (long s = 1; s <= p.events; s++) {
+		alpha = line.u;
+		Line::Window w = line.creep_step(beta);
+		if (!w.l) { std::cerr << "step " << s << ": no rearrangement up to lmax = " << line.lmax << "\n"; return 2; }
+		int Lact = 0, Lrel = 0;
+		long area = 0, sum = 0;
+		for (int i = 0; i < p.L; i++) {
+			Lact += alpha[i] != beta[i];
+			Lrel += alpha[i] != line.u[i];
+			area += line.u[i] - alpha[i];
+			sum += line.u[i];
+		}
+		ev << s << " " << w.l << " " << w.gain << " " << Lact << " " << Lrel << " " << area << " "
+		   << (double)sum / p.L << " " << line.energy(line.u) << std::endl;
+		if (p.save_events)
+			for (const auto *x : {&alpha, &beta, &line.u}) evconf.write((const char *)x->data(), sizeof(int) * p.L);
+		if (p.conf_every > 0 && s % p.conf_every == 0) conf.write((const char *)line.u.data(), sizeof(int) * p.L);
+		if (p.advance > 0 && (double)sum / p.L - u_start >= p.advance) break;
+	}
+	return 0;
+}
