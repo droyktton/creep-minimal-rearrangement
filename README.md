@@ -40,6 +40,9 @@ Options (`build/mr_creep --help`):
 | `--kmc-seed` | seed of the kinetic Monte Carlo | 1 |
 | `--conf-every` | write the metastable state every n steps to `configs.bin` (int32, L per record) | 0 (never) |
 | `--save-events` | write α, the activated configuration and γ of every step to `events.bin` (int32, 3 records of L) | off |
+| `--save-moves` | write the time and the moved sites of every step to `moves.bin` (about 20 bytes per step) | off |
+| `--skip` | the steady state starts once the mean position has advanced by this much; the velocity is measured from there | 0 |
+| `--persistence` | T > 0: persistence and χ4 up to τ = X/v (needs `--skip`) | 0 (off) |
 | `--out` | output directory | `.` |
 
 Outputs:
@@ -55,13 +58,22 @@ Outputs:
   - `mean_u`, and `E`, the energy of γ;
   - `dt`: duration of the step at T > 0, in units of e^{U(2)/T}/ν₀ (0 at T = 0);
   - `i`: start of the activated window [i, i+l];
-  - `x_left`: left end of the moved region (sites with γ ≠ α) that contains the window.
+  - `x_left`, `extent`: the smallest arc [x_left, x_left + extent) that contains the moved sites (γ ≠ α). The moved set need not be contiguous, because the optimal path can touch the line inside the window.
+- `moves.bin` (with `--save-moves`): per step, the time (a double; the step number at T = 0), the number n of runs of moved sites (int32), and n pairs (start, length) (int32).
+- `summary.txt`: number of steps, advance and, in the steady state, steps, advance, time, velocity v and ln v. Times are in units of 1/ν₀, with rates ν₀·exp(−U(ℓ)/T). With `--persistence` it also gives τ_α and the maximum of χ4.
+- `persistence.dat` (with `--persistence`): τ, ⟨π⟩, ⟨π²⟩ and χ4, in the steady state [4]:
+  - π(τ) = (1/L) Σ_i p_i(τ), where p_i(τ) = 1 if site i does not move in [t₀, t₀ + τ];
+  - the averages run over origins t₀ every τ_max/10;
+  - χ4(τ) = L(⟨π²⟩ − ⟨π⟩²);
+  - τ_α is defined by ⟨π(τ_α)⟩ = 1/2;
+  - the grid of τ spans 10⁻³/v to X/v, where v is measured over the second half of the transient (advance `skip`/2 to `skip`).
+  - Both are accumulated during the run: each origin keeps the time of the first move of every site.
 
 ## Demo
 
-`demo/run_demo.sh` runs the examples below (about 10 minutes with 3 parallel jobs) and `demo/plot_demo.py` makes the figures.
+`demo/run_demo.sh` runs the examples below (about 40 minutes with 3 parallel jobs) and `demo/plot_demo.py` makes the figures.
 
-All runs use one sample: Philox disorder, seed 1, not periodic in u (`--M 0`), L = 1024. F_c of this sample is 0.927, computed with M = 4096. Each run continues until the line has advanced by 1200, and the analysis keeps the steady state (advance > 300).
+The runs use Philox disorder, seed 1, not periodic in u (`--M 0`), and L = 1024 (F_c = 0.927, computed with M = 4096), except the persistence runs, which use L = 512 (F_c = 0.949). Each run continues until the line has advanced by 1200, and the analysis keeps the steady state (advance > 300).
 
 ### T → 0⁺
 
@@ -78,15 +90,41 @@ F/F_c = 0.32, 0.11, 0.032 and 0.011.
 
 ### Finite temperature
 
-F = 0.093 (f = 0.1), ℓ_max = 50, U(ℓ) = ℓ^{1/3}, T = 0 (with the same ℓ_max), 0.25, 0.5, 1 and 2.
+F = 0.093 (f = 0.1), ℓ_max = 50, U(ℓ) = ℓ^{1/3}; T = 0 (with the same ℓ_max), 0.03, 0.1, 0.3 and 1.
 
 ![finite T](demo/figures/finite_t.png)
 
-- (a) Structure factor. At T > 0 the small-q part lies below that of T → 0⁺, towards the thermal ζ = 1/2.
-- (b) Window ℓ of the activated rearrangements. It widens with T. At T ≥ 1 it piles up near ℓ_max: the rates of U(ℓ) = ℓ^{1/3} hardly differ between windows, so the more numerous large windows dominate, and the results depend on ℓ_max.
-- (c) Velocity against 1/T, from the advance and Σdt in units of 1/ν₀. It follows Arrhenius with an effective barrier of 3.2 ≈ U(30), the barrier of the typical window.
-- (d, e) Activity maps at T = 1 and 2. Unlike at T → 0⁺, the events are spread uniformly, without clusters.
+- (a) Structure factor. At T = 0.03 it is that of T → 0⁺. As T grows, the small-q part goes below, towards the thermal ζ = 1/2.
+- (b) Window ℓ of the activated rearrangements. At T = 0.03 its distribution is that of T → 0⁺, and it widens with T. At T = 1 it piles up near ℓ_max: the rates of U(ℓ) = ℓ^{1/3} hardly differ between windows, so the more numerous large windows dominate, and the results depend on ℓ_max.
+- (c) Velocity against 1/T: Arrhenius, with an effective barrier of 2.9.
+- (d, e) Activity maps (extent of each event).
+  - At T = 0.03 the events form spatio-temporal clusters, as at T → 0⁺: these are the thermally activated avalanches.
+  - At T = 1 they are spread uniformly.
 - (f) Distribution of the event area.
+
+### Velocity
+
+f = 0.03, 0.1 and 0.3; T = 0.02, 0.03, 0.05, 0.07 and 0.1. Same sample, advance 1500, steady state after 300. The velocity is the advance over the steady-state time, in units of 1/ν₀ (`summary.txt`).
+
+![velocity](demo/figures/velocity.png)
+
+- (a) ln v against 1/T is Arrhenius at every f.
+- (b) T ln v against f^{−1/4}.
+- (c) The effective barrier −d ln v/d(1/T) is 3.67, 2.86 and 2.20 for f = 0.03, 0.1 and 0.3, and follows the creep law f^{−1/4}. This follows from the assumed U(ℓ) = ℓ^{1/3} with windows ℓ ∼ f^{−3/4}; it is not an independent prediction.
+
+### Persistence and four-point susceptibility
+
+Another sample of L = 512 (F_c = 0.949), the size used for χ4 in [4]. f = 0.1 and 0.3; T = 0.02 to 0.1. Each run advances by 6000, with the steady state after 300 and the persistence up to τ = 300/v (`persistence.dat`), and keeps the moved sites of every event (`--save-moves`).
+
+![persistence](demo/figures/persistence.png)
+
+- **Persistence maps** at f = 0.1, T = 0.02, 0.05 and 0.1. They show the time to the first move of every site after one origin, in units of τ_α. Sites move in large blocks at once, more so at low T.
+- **⟨π(τ)⟩**, against τ and against τ/τ_α. As T decreases, the decay around τ_α broadens.
+- **χ4(τ)** has a peak near τ_α, and the peak grows as T decreases.
+- **τ_α** is Arrhenius. Its slopes, 2.79 at f = 0.1 and 2.21 at f = 0.3, match the effective barriers of the velocity.
+- **χ4^max** grows as T decreases, roughly as T^{−ν_dep} with ν_dep = 4/3 as in [4], down to T ≈ 0.03.
+
+At T = 0.02 the time is dominated by a few very long waits; one of them takes about 18% of the steady-state time. The steady state then covers only a few τ_α. ⟨π⟩ still drops by 13% at the smallest τ and is 0.15 at τ = 300/v, so χ4 at this temperature has poor statistics. Lower T needs longer runs, or many samples.
 
 ## Model
 
@@ -140,7 +178,8 @@ The method gives the sequence of metastable states and the events, not the energ
 3. the cached windows against recomputing all windows at every step;
 4. the O(L) test for favourable blocks against the minimum over all blocks;
 5. at T > 0, all the candidates against brute force, and the cached against the recomputed windows with the same Monte Carlo numbers;
-6. the Philox disorder: the known answer of Philox4x32-10, the mean and variance of V, the cached band against direct generation, and the rectangles of correlated disorder.
+6. the Philox disorder: the known answer of Philox4x32-10, the mean and variance of V, the cached band against direct generation, and the rectangles of correlated disorder;
+7. the persistence and χ4 accumulated during the run against a direct computation on random events.
 
 With `KRGK=path/to/krgk_creep` it also checks that F_c and the critical configuration are those of krgk-creep (both with `--rng mt`).
 

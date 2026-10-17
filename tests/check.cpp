@@ -7,7 +7,8 @@
 //  5. at T > 0, the list of all improving windows against brute force, and the cached windows
 //     against recomputing every window at every step (same kinetic Monte Carlo numbers);
 //  6. the Philox disorder: known-answer test of Philox4x32-10, mean and variance of V, and the
-//     cached band against direct generation, and the rectangles of correlated disorder.
+//     cached band against direct generation, and the rectangles of correlated disorder;
+//  7. the persistence and chi4 accumulated on line against a direct computation on random events.
 #define main mr_main
 #include "../src/mr_creep.cpp"
 #undef main
@@ -197,5 +198,48 @@ int main()
 		if (std::abs(cm / cn) > 0.1) { bad6++; printf("rectangles: correlation at distance xi_u %g\n", cm / cn); }
 	}
 	printf("6. Philox disorder (known answer, moments, cached band, rectangles): %d mismatches\n", bad6);
-	return bad + bad2 + bad3 + bad4 + bad5 + bad6 ? 1 : 0;
+
+	int bad7 = 0;
+	{
+		const int L = 50;
+		std::mt19937 g(5);
+		std::uniform_real_distribution<double> U(0, 1);
+		std::vector<double> te;
+		std::vector<std::vector<int>> mv;
+		double t = 0;
+		for (int e = 0; e < 3000; e++) {
+			t += -std::log(1 - U(g)) * 0.02;
+			int x = g() % L, w = 1 + g() % 8;
+			std::vector<int> m;
+			for (int k = 0; k < w; k++) m.push_back((x + k) % L);
+			te.push_back(t); mv.push_back(m);
+		}
+		Persistence P(L);
+		P.start(te[0], 1.0, 3.0);  // tau from 1e-3 to 3, origins every 0.3
+		for (size_t e = 0; e < te.size(); e++) P.event(te[e], mv[e]);
+		// direct: the same origins (the first event time, then every 0.3 at the next event)
+		std::vector<double> origins;
+		double next = te[0];
+		for (double x : te) if (x >= next) { origins.push_back(x); next = x + 0.3; }
+		std::vector<double> S1(P.tau.size(), 0), S2(P.tau.size(), 0);
+		long n = 0;
+		for (double t0 : origins) {
+			if (t0 + 3.0 >= te.back()) break;  // not closed yet
+			n++;
+			for (size_t b = 0; b < P.tau.size(); b++) {
+				std::vector<char> movedq(L, 0);
+				for (size_t e = 0; e < te.size(); e++)
+					if (te[e] > t0 && te[e] - t0 <= P.tau[b]) for (int i : mv[e]) movedq[i] = 1;
+				double pi = 0;
+				for (char c : movedq) pi += !c;
+				pi /= L;
+				S1[b] += pi; S2[b] += pi * pi;
+			}
+		}
+		if (n != P.n) { bad7++; printf("persistence: %ld origins, direct %ld\n", P.n, n); }
+		else for (size_t b = 0; b < P.tau.size(); b++)
+			if (std::abs(S1[b] - P.S1[b]) > 1e-9 || std::abs(S2[b] - P.S2[b]) > 1e-9) bad7++;
+		printf("7. persistence and chi4 vs direct computation: %d mismatches (%ld origins)\n", bad7, n);
+	}
+	return bad + bad2 + bad3 + bad4 + bad5 + bad6 + bad7 ? 1 : 0;
 }

@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <deque>
 #include <iostream>
 #include <random>
 #include <string>
@@ -65,6 +66,9 @@ struct Params {
 	unsigned long kmc_seed = 1;          // random numbers of the kinetic Monte Carlo
 	int conf_every = 0;       // write the metastable configuration every n events (0: never)
 	bool save_events = false; // write alpha, the activated configuration and gamma of every event
+	bool save_moves = false;  // write the time and the moved sites (as runs) of every event to moves.bin
+	double skip = 0;          // steady state after this advance: velocity (and persistence) measured there
+	double persistence = 0;   // T > 0: persistence and chi4 up to tau = persistence / v (0: off)
 	std::string out = ".";
 };
 
@@ -415,6 +419,54 @@ public:
 	}
 };
 
+// Persistence and four-point susceptibility of G. Russo et al., arXiv:2604.17600:
+//   pi(tau) = (1/L) sum_i p_i(tau), p_i = 1 if site i does not move in [t0, t0 + tau],
+//   averaged over origins t0 of the steady state, and chi4(tau) = L (<pi^2> - <pi>^2).
+// Origins are opened every tmax/10; each keeps the time of the first move of every site after
+// t0, and is closed, adding pi and pi^2 on the grid of tau, once t > t0 + tmax.
+class Persistence {
+	int L;
+	double tmax = 0, every = 0, next = 0;
+	struct Origin { double t0; std::vector<double> first; };
+	std::deque<Origin> open;
+	void close(const Origin &o)
+	{
+		std::vector<double> f;
+		for (double x : o.first) if (x <= tmax) f.push_back(x);
+		std::sort(f.begin(), f.end());
+		size_t k = 0;
+		for (size_t b = 0; b < tau.size(); b++) {
+			while (k < f.size() && f[k] <= tau[b]) k++;
+			double pi = (double)(L - (long)k) / L;
+			S1[b] += pi; S2[b] += pi * pi;
+		}
+		n++;
+	}
+public:
+	std::vector<double> tau, S1, S2;
+	long n = 0;
+	explicit Persistence(int L) : L(L) {}
+	bool on() const { return tmax > 0; }
+	// tau from 1e-3 tau1 to X tau1, 60 values per log scale, origins from time t on
+	void start(double t, double tau1, double X)
+	{
+		tmax = X * tau1;
+		int nb = (int)(60 * std::log10(X / 1e-3)) + 1;
+		for (int b = 0; b < nb; b++) tau.push_back(1e-3 * tau1 * std::pow(X / 1e-3, (double)b / (nb - 1)));
+		S1.assign(nb, 0); S2.assign(nb, 0);
+		every = tmax / 10; next = t;
+	}
+	// an event at time t moved the sites in moved
+	void event(double t, const std::vector<int> &moved)
+	{
+		while (!open.empty() && t > open.front().t0 + tmax) { close(open.front()); open.pop_front(); }
+		for (auto &o : open)
+			for (int i : moved) if (o.first[i] > tmax) o.first[i] = t - o.t0;
+		if (t >= next) { open.push_back({t, std::vector<double>(L, 2 * tmax)}); next = t + every; }
+	}
+	double chi4(size_t b) const { double m = S1[b] / n; return L * (S2[b] / n - m * m); }
+};
+
 static void usage(const char *prog)
 {
 	std::cerr << "usage: " << prog << " [options]\n"
@@ -437,6 +489,9 @@ static void usage(const char *prog)
 	          << "  --kmc-seed N   seed of the kinetic Monte Carlo             [1]\n"
 	          << "  --conf-every N write the metastable state every N steps    [0: never]\n"
 	          << "  --save-events  write alpha, activated and gamma of every step to events.bin\n"
+	          << "  --save-moves   write the time and the moved sites of every step to moves.bin\n"
+	          << "  --skip X       steady state after an advance X: velocity in summary.txt [0]\n"
+	          << "  --persistence X  T > 0: persistence and chi4 up to tau = X/v (needs --skip) [0: off]\n"
 	          << "  --out DIR      output directory                            [.]\n"
 	          << "Threads: OMP_NUM_THREADS.\n";
 }
@@ -471,6 +526,9 @@ int main(int argc, char **argv)
 		else if (o == "--kmc-seed") p.kmc_seed = std::stoul(val());
 		else if (o == "--conf-every") p.conf_every = std::stoi(val());
 		else if (o == "--save-events") p.save_events = true;
+		else if (o == "--skip") p.skip = std::stod(val());
+		else if (o == "--save-moves") p.save_moves = true;
+		else if (o == "--persistence") p.persistence = std::stod(val());
 		else if (o == "--out") p.out = val();
 		else { usage(argv[0]); return 1; }
 	}
@@ -478,6 +536,7 @@ int main(int argc, char **argv)
 	if (p.M == 0 && !p.philox) { std::cerr << "M = 0 (no period) needs --rng philox\n"; return 1; }
 	if (p.M == 0 && !p.f_absolute) { std::cerr << "M = 0: F_c cannot be located, give F with --absolute\n"; return 1; }
 	if (p.lmax >= p.L) { std::cerr << "need lmax < L\n"; return 1; }
+	if (p.persistence > 0 && (p.T <= 0 || p.skip <= 0)) { std::cerr << "--persistence needs T > 0 and --skip\n"; return 1; }
 
 	if (p.xi_x < 1 || p.xi_u < 1 || p.L % p.xi_x || (p.M > 0 && p.M % p.xi_u) || (!p.philox && (p.xi_x > 1 || p.xi_u > 1))) {
 		std::cerr << "need xi_x, xi_u >= 1, xi_x dividing L and xi_u dividing M, and --rng philox if xi > 1\n";
@@ -505,23 +564,35 @@ int main(int argc, char **argv)
 	}
 	std::ofstream ev(p.out + "/events.dat");
 	// dt: time of the step at T > 0, in units of exp(U(2)/T)/nu0 (0 at T = 0)
-	ev << "# step l gain L_act L_rel area mean_u E dt i x_left\n";
+	ev << "# step l gain L_act L_rel area mean_u E dt i x_left extent\n";
 	ev.precision(10);
 	std::ofstream conf, evconf;
 	if (p.conf_every > 0) conf.open(p.out + "/configs.bin", std::ios::binary);
 	if (p.save_events) evconf.open(p.out + "/events.bin", std::ios::binary);
+	std::ofstream mvf;
+	if (p.save_moves) mvf.open(p.out + "/moves.bin", std::ios::binary);
 
-	std::vector<int> alpha, beta(p.L);
+	std::vector<int> alpha, beta(p.L), moved;
 	double u_start = 0;
 	for (int v : line.u) u_start += (double)v / p.L;
+	// time in units of 1/nu0: dt exp(U(2)/T)
+	const double tscale = p.T > 0 ? std::exp(p.U0 * std::pow(2.0, p.theta) / p.T) : 0.0;
+	if (!std::isfinite(tscale)) { std::cerr << "exp(U(2)/T) overflows: raise T\n"; return 1; }
+	double t = 0, t_half = -1, u_half = 0, t_skip = -1, u_skip = 0, u_now = u_start;
+	long s_skip = 0, s_last = 0;
+	Persistence pers(p.L);
 	for (long s = 1; s <= p.events; s++) {
 		alpha = line.u;
 		Line::Window w = line.creep_step(beta);
 		if (!w.l) { std::cerr << "step " << s << ": no rearrangement up to lmax = " << line.lmax << "\n"; return 2; }
-		// left end of the moved region that contains the activated window (sites i+1 .. i+l-1)
-		int x_left = (line.last_i + 1) % p.L;
-		for (int k = 0; k < p.L && alpha[(x_left - 1 + p.L) % p.L] != line.u[(x_left - 1 + p.L) % p.L]; k++)
-			x_left = (x_left - 1 + p.L) % p.L;
+		// moved sites, and the smallest arc [x_left, x_left + extent) that contains them: the moved
+		// set need not be contiguous, since the optimal path can touch the line inside the window
+		moved.clear();
+		for (int i = 0; i < p.L; i++) if (alpha[i] != line.u[i]) moved.push_back(i);
+		int x_left = moved[0], gap = moved[0] + p.L - moved.back();
+		for (size_t k = 1; k < moved.size(); k++)
+			if (moved[k] - moved[k - 1] > gap) { gap = moved[k] - moved[k - 1]; x_left = moved[k]; }
+		int extent = p.L - gap + 1;
 		int Lact = 0, Lrel = 0;
 		long area = 0, sum = 0;
 		for (int i = 0; i < p.L; i++) {
@@ -532,11 +603,63 @@ int main(int argc, char **argv)
 		}
 		ev << s << " " << w.l << " " << w.gain << " " << Lact << " " << Lrel << " " << area << " "
 		   << (double)sum / p.L << " " << line.energy(line.u) << " " << (p.T > 0 ? line.dt : 0.0) << " "
-		   << line.last_i << " " << x_left << std::endl;
+		   << line.last_i << " " << x_left << " " << extent << std::endl;
 		if (p.save_events)
 			for (const auto *x : {&alpha, &beta, &line.u}) evconf.write((const char *)x->data(), sizeof(int) * p.L);
 		if (p.conf_every > 0 && s % p.conf_every == 0) conf.write((const char *)line.u.data(), sizeof(int) * p.L);
-		if (p.advance > 0 && (double)sum / p.L - u_start >= p.advance) break;
+		// time, steady state and persistence
+		t += line.dt * tscale;
+		u_now = (double)sum / p.L;
+		s_last = s;
+		if (t_half < 0 && u_now - u_start >= p.skip / 2) { t_half = t; u_half = u_now; }
+		if (t_skip < 0 && u_now - u_start >= p.skip) {
+			t_skip = t; u_skip = u_now; s_skip = s;
+			if (p.persistence > 0) {
+				double v = (u_skip - u_half) / (t_skip - t_half);  // velocity over the second half of the transient
+				pers.start(t, 1.0 / v, p.persistence);
+			}
+		}
+		if (pers.on()) pers.event(t, moved);
+		if (p.save_moves) {  // record: double time (step at T = 0), int32 n, n x (int32 start, int32 length)
+			std::vector<int32_t> runs;
+			for (size_t k = 0; k < moved.size(); k++)
+				if (k == 0 || moved[k] != moved[k - 1] + 1) { runs.push_back(moved[k]); runs.push_back(1); }
+				else runs.back()++;
+			double tt = p.T > 0 ? t : (double)s;
+			int32_t n = (int32_t)runs.size() / 2;
+			mvf.write((const char *)&tt, sizeof tt);
+			mvf.write((const char *)&n, sizeof n);
+			mvf.write((const char *)runs.data(), sizeof(int32_t) * runs.size());
+		}
+		if (p.advance > 0 && u_now - u_start >= p.advance) break;
+	}
+
+	// steady-state summary; time in units of 1/nu0 (T > 0)
+	std::ofstream sum(p.out + "/summary.txt");
+	sum.precision(10);
+	sum << "events " << s_last << "\nadvance " << u_now - u_start << "\n";
+	if (t_skip >= 0) {
+		sum << "steady_events " << s_last - s_skip << "\nsteady_advance " << u_now - u_skip << "\n";
+		if (p.T > 0)
+			sum << "steady_time " << t - t_skip << "\nv " << (u_now - u_skip) / (t - t_skip)
+			    << "\nln_v " << std::log((u_now - u_skip) / (t - t_skip)) << "\n";
+	}
+	if (pers.on() && pers.n > 0) {
+		std::ofstream po(p.out + "/persistence.dat");
+		po.precision(10);
+		po << "# tau pi pi2 chi4 (" << pers.n << " origins; tau in units of 1/nu0)\n";
+		double tau_a = -1, cmax = -1, tau_c = 0;
+		for (size_t b = 0; b < pers.tau.size(); b++) {
+			double m = pers.S1[b] / pers.n;
+			po << pers.tau[b] << " " << m << " " << pers.S2[b] / pers.n << " " << pers.chi4(b) << "\n";
+			if (tau_a < 0 && m <= 0.5 && b > 0) {  // log-linear interpolation of pi = 1/2
+				double m0 = pers.S1[b - 1] / pers.n;
+				tau_a = pers.tau[b - 1] * std::pow(pers.tau[b] / pers.tau[b - 1], (m0 - 0.5) / (m0 - m));
+			}
+			if (pers.chi4(b) > cmax) { cmax = pers.chi4(b); tau_c = pers.tau[b]; }
+		}
+		sum << "persistence_origins " << pers.n << "\ntau_alpha " << tau_a << "\nchi4_max " << cmax
+		    << "\ntau_chi4_max " << tau_c << "\n";
 	}
 	return 0;
 }

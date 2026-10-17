@@ -5,6 +5,9 @@ t0_creep.png: T -> 0+ at several forces (one sample, L = 1024): activity map and
   size of the rearrangements against f, and the statistics of the events.
 finite_t.png: F = 0.093 at several temperatures: structure factor, window sizes, velocity against
   1/T, activity maps and event areas.
+velocity.png: f = 0.03, 0.1, 0.3 and T = 0.02 .. 0.1: velocity v(f, T), creep law and effective barrier.
+persistence.png (L = 512, F_c = 0.949): persistence maps, persistence pi(tau) and four-point
+  susceptibility chi4(tau) (Russo et al.), relaxation time tau_alpha and the maximum of chi4.
 
 Steady state: the states and events after the line has advanced by SKIP.
 """
@@ -17,6 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 SKIP = 300
+FC512 = 0.9487  # F_c of the L = 512 sample of the persistence runs (M = 4096)
 ZEQ, ZDEP = 2 / 3, 1.25
 NUEQ = 1 / (2 - ZEQ)  # 3/4
 
@@ -28,7 +32,8 @@ def load(d):
         par[k] = v.split()[0]
     L = int(par["L"])
     ev = np.loadtxt(f"{d}/events.dat", ndmin=2)
-    c = np.fromfile(f"{d}/configs.bin", dtype=np.int32)
+    cf = f"{d}/configs.bin"
+    c = np.fromfile(cf, dtype=np.int32) if os.path.exists(cf) else np.zeros(L, np.int32)
     c = c[:len(c) // L * L].reshape(-1, L)
     adv = ev[:, 6] - ev[0, 6]
     ss = adv > SKIP
@@ -51,12 +56,12 @@ def logbins(x, n=25):
 
 
 def activity(ax, D, n=1500, title=""):
-    """Moved regions of n consecutive steady-state events: [x_left, x_left + L_rel) at height step."""
+    """Extent of n consecutive steady-state events: the arc [x_left, x_left + extent) at height step."""
     ev = D["ev"][D["ss"]][:n]
     L = D["L"]
     xs, ys = [], []
     for k, e in enumerate(ev):
-        x0, w = int(e[10]), int(e[4])
+        x0, w = int(e[10]), int(e[11])
         for a, b in ((x0, min(x0 + w, L)), (0, max(0, x0 + w - L))):  # periodic wrap
             if b > a:
                 xs += [a, b, None]; ys += [k, k, None]
@@ -146,7 +151,7 @@ def finite_t(runs, figs, Fc):
     ax[0, 2].plot(x, np.polyval(b, x), "C3--", label=f"slope {-b[0]:.2f} (effective barrier)")
     ax[0, 2].set(xlabel="1/T", ylabel="ln v  ($\\nu_0$ = 1)", title="(c) velocity (Arrhenius)")
     ax[0, 2].legend(fontsize=8)
-    activity(ax[1, 0], D[Tp[len(Tp) // 2]], title=f"(d) activity map, T = {Tp[len(Tp) // 2]:g}")
+    activity(ax[1, 0], D[Tp[0]], title=f"(d) activity map, T = {Tp[0]:g}")
     activity(ax[1, 1], D[Tp[-1]], title=f"(e) activity map, T = {Tp[-1]:g}")
     L, F = D[Ts[0]]["L"], D[Ts[0]]["F"]
     fig.suptitle(f"Finite temperature, one sample, L = {L}, f = {F / Fc:.2g}, $l_{{max}}$ = 50, "
@@ -159,9 +164,145 @@ def finite_t(runs, figs, Fc):
     print(f"Arrhenius slope (effective barrier): {-b[0]:.3f}")
 
 
+def summary(d):
+    out = {}
+    for l in open(f"{d}/summary.txt"):
+        k, v = l.split()
+        out[k] = float(v)
+    return out
+
+
+def load_vt(runs, prefix):
+    R = {}
+    for d in os.listdir(runs):
+        if d.startswith(prefix):
+            F, T = d[len(prefix):].split("_T")
+            pf = f"{runs}/{d}/persistence.dat"
+            R[(float(F), float(T))] = dict(d=f"{runs}/{d}", s=summary(f"{runs}/{d}"),
+                                          p=np.loadtxt(pf) if os.path.exists(pf) else None)
+    return R
+
+
+def velocity(runs, figs, Fc):
+    R = load_vt(runs, "vT_F")
+    Fs = sorted({F for F, _ in R})
+    Ts = sorted({T for _, T in R})
+    cf = dict(zip(Fs, plt.cm.viridis(np.linspace(0, 0.85, len(Fs)))))
+    ct = dict(zip(Ts, plt.cm.plasma(np.linspace(0, 0.85, len(Ts)))))
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4.6))
+    Ueff = {}
+    for F in Fs:
+        T = np.array([T for T in Ts if (F, T) in R])
+        lnv = np.array([R[(F, t)]["s"]["ln_v"] for t in T])
+        b = np.polyfit(1 / T, lnv, 1)
+        Ueff[F] = -b[0]
+        ax[0].plot(1 / T, lnv, "o-", color=cf[F], label=f"f = {F / Fc:.2g}: slope {-b[0]:.2f}")
+    ax[0].set(xlabel="1/T", ylabel="ln v  ($\\nu_0$ = 1)", title="(a) velocity against 1/T")
+    ax[0].legend(fontsize=8)
+    for T in Ts:
+        F = np.array([F for F in Fs if (F, T) in R])
+        ax[1].plot((F / Fc) ** -0.25, [T * R[(f, T)]["s"]["ln_v"] for f in F], "o-", color=ct[T], label=f"T = {T:g}")
+    ax[1].set(xlabel="$f^{-1/4}$", ylabel="T ln v", title="(b) creep law: T ln v against $f^{-1/4}$")
+    ax[1].legend(fontsize=8)
+    f = np.array(Fs) / Fc
+    ax[2].loglog(f, [Ueff[F] for F in Fs], "ko-", label="$-d \\ln v / d(1/T)$")
+    ax[2].loglog(f, Ueff[Fs[1]] * (f / f[1]) ** -0.25, "C3--", label="$f^{-1/4}$")
+    ax[2].set(xlabel="$f = F/F_c$", ylabel="effective barrier", title="(c) effective barrier against f")
+    ax[2].legend(fontsize=8)
+    fig.suptitle("Mean velocity v(f, T), one sample, L = 1024, $l_{max}$ = 50, U(l) = $l^{1/3}$; steady state (advance 300 to 1500)")
+    fig.tight_layout()
+    fig.savefig(f"{figs}/velocity.png", dpi=110)
+    for F in Fs:
+        print(f"f = {F / Fc:.2g}: ln v " + ", ".join(f"T={T:g}: {R[(F, T)]['s']['ln_v']:.2f}" for T in Ts if (F, T) in R)
+              + f"; effective barrier {Ueff[F]:.2f}")
+
+
+def read_moves(d):
+    """moves.bin: per event the time and the runs (start, length) of moved sites."""
+    raw = open(f"{d}/moves.bin", "rb").read()
+    pos, out = 0, []
+    while pos < len(raw):
+        t = np.frombuffer(raw, np.float64, 1, pos)[0]
+        n = int(np.frombuffer(raw, np.int32, 1, pos + 8)[0])
+        out.append((t, np.frombuffer(raw, np.int32, 2 * n, pos + 12).reshape(n, 2)))
+        pos += 12 + 8 * n
+    return out
+
+
+def persistence_map(ax, r, tau_a, title):
+    """Time to the first move of every site after one origin t0 in the steady state, in units of tau_alpha."""
+    D = load(r["d"])
+    L = D["L"]
+    mv = read_moves(r["d"])
+    k0 = int(np.argmax(D["adv"] > 600))  # an origin well inside the steady state
+    t0 = mv[k0][0]
+    first = np.full(L, np.inf)
+    for t, runs in mv[k0 + 1:]:
+        for a, w in runs:
+            seg = first[a:a + w]
+            seg[np.isinf(seg)] = t - t0
+        if t - t0 > 100 * tau_a:
+            break
+    y = np.minimum(first / tau_a, 1e3)
+    ax.fill_between(np.arange(L), 1e-3, y, step="mid", color="C0", lw=0)
+    ax.axhline(1, color="k", lw=0.6)
+    ax.set(yscale="log", ylim=(1e-3, 1e2), xlim=(0, L), xlabel="$x$", ylabel="time to the first move / $\\tau_\\alpha$",
+           title=title)
+
+
+def persistence(runs, figs, Fc):
+    R = load_vt(runs, "pT_F")
+    Fs = sorted({F for F, _ in R})
+    Ts = sorted({T for _, T in R})
+    cf = dict(zip(Fs, plt.cm.viridis(np.linspace(0, 0.85, len(Fs)))))
+    ct = dict(zip(Ts, plt.cm.plasma(np.linspace(0, 0.85, len(Ts)))))
+    F1 = min(Fs, key=lambda F: abs(F / Fc - 0.1))
+    fig, ax = plt.subplots(2, 4, figsize=(20, 9))
+    for a, T in zip(ax[0], [Ts[0], Ts[len(Ts) // 2], Ts[-1]]):
+        persistence_map(a, R[(F1, T)], R[(F1, T)]["s"]["tau_alpha"],
+                        f"persistence map, f = {F1 / Fc:.2g}, T = {T:g}\n(sites not moved yet lie under the curve)")
+    for T in Ts:
+        if (F1, T) not in R:
+            continue
+        P, ta = R[(F1, T)]["p"], R[(F1, T)]["s"]["tau_alpha"]
+        ax[0, 3].semilogx(P[:, 0], P[:, 1], color=ct[T], label=f"T = {T:g}")
+        ax[1, 0].semilogx(P[:, 0] / ta, P[:, 1], color=ct[T], label=f"T = {T:g}")
+        ax[1, 1].semilogx(P[:, 0] / ta, P[:, 3], color=ct[T], label=f"T = {T:g}")
+    ax[0, 3].set(xlabel="$\\tau$  (1/$\\nu_0$)", ylabel="$\\langle\\pi(\\tau)\\rangle$", title=f"persistence, f = {F1 / Fc:.2g}")
+    ax[0, 3].legend(fontsize=7)
+    ax[1, 0].axhline(0.5, color="k", lw=0.5)
+    ax[1, 0].set(xlabel="$\\tau / \\tau_\\alpha$", ylabel="$\\langle\\pi(\\tau)\\rangle$", title=f"persistence against $\\tau/\\tau_\\alpha$, f = {F1 / Fc:.2g}")
+    ax[1, 0].legend(fontsize=7)
+    ax[1, 1].set(xlabel="$\\tau / \\tau_\\alpha$", ylabel="$\\chi_4(\\tau)$", title=f"four-point susceptibility, f = {F1 / Fc:.2g}")
+    ax[1, 1].legend(fontsize=7)
+    for F in Fs:
+        T = np.array([T for T in Ts if (F, T) in R])
+        ta = np.array([R[(F, t)]["s"]["tau_alpha"] for t in T])
+        ok = ta > 0
+        b = np.polyfit(1 / T[ok], np.log(ta[ok]), 1)
+        ax[1, 2].semilogy(1 / T[ok], ta[ok], "o-", color=cf[F], label=f"f = {F / Fc:.2g}: slope {b[0]:.2f}")
+        ax[1, 3].loglog(T, [R[(F, t)]["s"]["chi4_max"] for t in T], "o-", color=cf[F], label=f"f = {F / Fc:.2g}")
+    ax[1, 2].set(xlabel="1/T", ylabel="$\\tau_\\alpha$  (1/$\\nu_0$)", title="relaxation time, $\\langle\\pi(\\tau_\\alpha)\\rangle$ = 1/2")
+    ax[1, 2].legend(fontsize=8)
+    T = np.array(Ts)
+    c0 = R[(F1, Ts[0])]["s"]["chi4_max"]
+    ax[1, 3].loglog(T, c0 * (T / T[0]) ** (-4 / 3), "k--", label="$T^{-\\nu_{dep}}$, $\\nu_{dep}$ = 4/3")
+    ax[1, 3].set(xlabel="T", ylabel="$\\chi_4^{max}$", title="maximum of $\\chi_4$")
+    ax[1, 3].legend(fontsize=8)
+    fig.suptitle(f"Persistence and dynamical heterogeneity (Russo et al.), one sample, L = 512, $F_c$ = {Fc:.3g}, "
+                 "$l_{max}$ = 50, U(l) = $l^{1/3}$; steady state (advance 300 to 6000)")
+    fig.tight_layout()
+    fig.savefig(f"{figs}/persistence.png", dpi=110)
+    for F in Fs:
+        print(f"f = {F / Fc:.2g}: " + ", ".join(f"T={T:g}: tau_a {R[(F, T)]['s']['tau_alpha']:.3g} chi4max {R[(F, T)]['s']['chi4_max']:.1f}"
+                                             for T in Ts if (F, T) in R))
+
+
 if __name__ == "__main__":
     runs, figs = sys.argv[1], sys.argv[2]
     Fc = float(sys.argv[3]) if len(sys.argv) > 3 else 0.927  # F_c of the demo sample (M = 4096)
     os.makedirs(figs, exist_ok=True)
     t0(runs, figs, Fc)
     finite_t(runs, figs, Fc)
+    velocity(runs, figs, Fc)
+    persistence(runs, figs, FC512)
