@@ -3,3 +3,4 @@ runs/
 *.o
 pilot/*/
 pilot/*.log
+__pycache__/

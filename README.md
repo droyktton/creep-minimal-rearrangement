@@ -135,6 +135,17 @@ Another sample of L = 512 (F_c = 0.949), the size used for χ4 in [4]. f = 0.1 a
 
 At T = 0.02 the time is dominated by a few very long waits; one of them takes about 18% of the steady-state time. The steady state then covers only a few τ_α. ⟨π⟩ still drops by 13% at the smallest τ and is 0.15 at τ = 300/v, so χ4 at this temperature has poor statistics. Lower T needs longer runs, or many samples.
 
+## Velocity and waiting times at low T (cluster runs)
+
+The `ell` and `lowT` grids of `cluster/make_tasks.py` at L = 4096: f = 0.01 to 0.1, T = 0.02 to 0.1, 4 samples per point, advance 3000, steady state after 300. `analysis/arrhenius.py` gives the effective barriers, `analysis/waits.py` the statistics of the waits, and `analysis/plot_lowT.py` makes the figure.
+
+![low T](analysis/figures/lowT.png)
+
+- **(a, b) The mean velocity stays Arrhenius down to T = 0.02.** The effective barrier −d ln v/d(1/T) is 4.81, 4.11, 3.78, 3.37 and 2.90 from f = 0.01 to 0.1. Fitted on T ≤ 0.03 alone, it is the same within 0.12. It follows f^{−1/4} (U_eff f^{1/4} = 1.52 to 1.63), which again comes from the assumed U(ℓ).
+- **(c) The waits have a power-law tail**, P(dt > t) ~ t^{−μ}, with μ growing about linearly with T, μ ≈ T/T₀. T₀ goes from 0.075 at f = 0.01 to 0.026 at f = 0.1, as in a trap model with exponentially distributed barriers. μ < 1 at T ≤ 0.03 for all f, and at T = 0.05 for f ≤ 0.02: the mean wait then diverges.
+- **(d, e) Then a few waits set the time.** At T = 0.02 and f = 0.01, the longest wait is on average 41% of the steady-state time (up to 63%), and the 10 longest are 87%. v does not average within a run: ln v changes by 3 to 6 between quarters of the run, and by 1 to 2 between samples, against 0.05 at T = 0.1. At T ≤ 0.03 only ln v averaged over samples is meaningful.
+- **(f) The persistence window is too short at low T.** The run sets τ_max = X/v with v measured over the second half of the transient, which misses the long waits. At T = 0.02 this v is 10 to more than 1000 times too large, and the window covers an advance of at most 90 instead of 1000, so τ_α is not reached in most samples (`nan` in `summary.txt`). Where π crosses 1/2, it does so at an advance v τ_α ≈ 20 to 30 at every T. The persistence can be recomputed from `moves.bin` over the whole steady state.
+
 ## Model
 
 Energy of the line u_i (integer, i = 0..L−1, periodic):
